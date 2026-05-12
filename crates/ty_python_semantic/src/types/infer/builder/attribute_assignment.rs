@@ -498,7 +498,8 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
     ) -> bool {
         let db = self.builder.db();
         let assignable =
-            value_ty.is_assignable_to(db, self.builder.program_environment(), target_ty);
+            value_ty.is_assignable_to(db, self.builder.program_environment(), target_ty)
+                || TypeInferenceBuilder::django_file_field_accepts_value(db, value_ty, target_ty);
         if !assignable && emit_diagnostics {
             report_invalid_attribute_assignment(
                 &self.builder.context,

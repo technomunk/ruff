@@ -70,6 +70,7 @@ use ty_python_core::definition::Definition;
 use ty_python_core::scope::ScopeId;
 use ty_python_core::{place_table, use_def_map};
 
+pub(crate) mod django_model;
 mod dynamic_literal;
 mod enum_literal;
 mod implicit_attributes;

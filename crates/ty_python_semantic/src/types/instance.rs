@@ -178,7 +178,7 @@ impl<'db> Type<'db> {
     }
 
     /// Synthesize a protocol instance type with a given set of methods.
-    pub(super) fn protocol_with_methods<'a, M>(
+    pub(crate) fn protocol_with_methods<'a, M>(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         methods: M,
