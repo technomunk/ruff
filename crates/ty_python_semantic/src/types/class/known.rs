@@ -153,6 +153,8 @@ pub enum KnownClass {
     TyExtensionsAsyncIterator,
     TyExtensionsIterable,
     TyExtensionsIterator,
+    // django.db.models
+    DjangoModel,
 }
 
 impl KnownClass {
@@ -279,7 +281,8 @@ impl KnownClass {
             | Self::ProtocolMeta
             | Self::FunctoolsPartial
             | Self::ExtensionTypedDictFallback
-            | Self::TypedDictFallback => Some(Truthiness::Ambiguous),
+            | Self::TypedDictFallback
+            | Self::DjangoModel => Some(Truthiness::Ambiguous),
 
             Self::Tuple => None,
         }
@@ -387,7 +390,8 @@ impl KnownClass {
             | KnownClass::ProtocolMeta
             | KnownClass::Template
             | KnownClass::Path
-            | KnownClass::FunctoolsPartial => false,
+            | KnownClass::FunctoolsPartial
+            | KnownClass::DjangoModel => false,
         }
     }
 
@@ -492,7 +496,8 @@ impl KnownClass {
             | KnownClass::ProtocolMeta
             | KnownClass::Template
             | KnownClass::Path
-            | KnownClass::FunctoolsPartial => false,
+            | KnownClass::FunctoolsPartial
+            | KnownClass::DjangoModel => false,
         }
     }
 
@@ -596,7 +601,8 @@ impl KnownClass {
             | KnownClass::ProtocolMeta
             | KnownClass::Template
             | KnownClass::Path
-            | KnownClass::FunctoolsPartial => false,
+            | KnownClass::FunctoolsPartial
+            | KnownClass::DjangoModel => false,
         }
     }
 
@@ -713,7 +719,8 @@ impl KnownClass {
             | Self::Path
             | Self::FunctoolsPartial
             | Self::Mapping
-            | Self::Sequence => false,
+            | Self::Sequence
+            | Self::DjangoModel => false,
         }
     }
 
@@ -819,7 +826,8 @@ impl KnownClass {
             | KnownClass::FunctoolsPartial
             | KnownClass::ConstraintSet
             | KnownClass::GenericContext
-            | KnownClass::Specialization => false,
+            | KnownClass::Specialization
+            | KnownClass::DjangoModel => false,
             KnownClass::NamedTupleFallback
             | KnownClass::TypedDictFallback
             | KnownClass::ExtensionTypedDictFallback => true,
@@ -939,6 +947,7 @@ impl KnownClass {
             Self::Path => "Path",
             Self::FunctoolsPartial => "partial",
             Self::ProtocolMeta => "_ProtocolMeta",
+            Self::DjangoModel => "Model",
         }
     }
 
@@ -954,6 +963,9 @@ impl KnownClass {
                     class: known_class,
                     db,
                 } = *self;
+                if known_class == KnownClass::DjangoModel {
+                    return write!(f, "django.db.models.Model");
+                }
                 write!(
                     f,
                     "{module}.{class}",
@@ -1083,6 +1095,10 @@ impl KnownClass {
         self,
         db: &dyn Db,
     ) -> Result<StaticClassLiteral<'_>, KnownClassLookupError<'_>> {
+        // `DjangoModel` has no typeshed stub, so skip the symbol lookup.
+        if self == Self::DjangoModel {
+            return Err(KnownClassLookupError::ClassNotFound);
+        }
         let symbol = known_module_symbol(db, self.canonical_module(db), self.name(db)).place;
         match symbol {
             Place::Defined(DefinedPlace {
@@ -1309,6 +1325,10 @@ impl KnownClass {
             Self::Template => KnownModule::Templatelib,
             Self::Path => KnownModule::Pathlib,
             Self::FunctoolsPartial => KnownModule::Functools,
+            // `DjangoModel` is not in typeshed; this sentinel value is never reached because
+            // `try_to_class_literal_without_logging` and `display` both early-return for
+            // `DjangoModel`, and `check_module` returns `false` for it.
+            Self::DjangoModel => KnownModule::Builtins,
         }
     }
 
@@ -1415,7 +1435,8 @@ impl KnownClass {
             | Self::Template
             | Self::Path
             | Self::UnionType
-            | Self::FunctoolsPartial => Some(false),
+            | Self::FunctoolsPartial
+            | Self::DjangoModel => Some(false),
 
             Self::Tuple => None,
         }
@@ -1525,7 +1546,8 @@ impl KnownClass {
             | Self::ProtocolMeta
             | Self::Template
             | Self::Path
-            | Self::FunctoolsPartial => false,
+            | Self::FunctoolsPartial
+            | Self::DjangoModel => false,
         }
     }
 
@@ -1635,15 +1657,20 @@ impl KnownClass {
             "partial" => &[Self::FunctoolsPartial],
             "_ProtocolMeta" => &[Self::ProtocolMeta],
             "_TypedDict" => &[Self::ExtensionTypedDictFallback],
+            "Model" => &[Self::DjangoModel],
             _ => return None,
         };
 
-        let module = file_to_module(db, file)?.known(db)?;
-
-        candidates
-            .iter()
-            .copied()
-            .find(|&candidate| candidate.check_module(db, module))
+        let module = file_to_module(db, file)?;
+        let known_module = module.known(db);
+        let module_name = module.name(db);
+        candidates.iter().copied().find(|&candidate| {
+            if let Some(known) = known_module {
+                candidate.check_module(db, known)
+            } else {
+                candidate.check_django_module(module_name.as_str())
+            }
+        })
     }
 
     /// Return `true` if the module of `self` matches `module`
@@ -1748,6 +1775,17 @@ impl KnownClass {
             | Self::ProtocolMeta
             | Self::NewType => matches!(module, KnownModule::Typing | KnownModule::TypingExtensions),
             Self::Deprecated => matches!(module, KnownModule::Warnings | KnownModule::TypingExtensions),
+            Self::DjangoModel => false,
+        }
+    }
+
+    /// Return `true` if this class can come from the given third-party module name.
+    fn check_django_module(self, module_name: &str) -> bool {
+        match self {
+            Self::DjangoModel => {
+                module_name == "django.db.models" || module_name == "django.db.models.base"
+            }
+            _ => false,
         }
     }
 
@@ -1971,6 +2009,10 @@ mod tests {
                 source: PythonVersionSource::default(),
             });
         for class in KnownClass::iter() {
+            // Third-party; not in typeshed.
+            if class == KnownClass::DjangoModel {
+                continue;
+            }
             let class_name = class.name(&db);
             let class_module =
                 resolve_module_confident(&db, &class.canonical_module(&db).name()).unwrap();
@@ -1999,6 +2041,10 @@ mod tests {
             });
 
         for class in KnownClass::iter() {
+            if class == KnownClass::DjangoModel {
+                continue;
+            }
+
             // Check the class can be looked up successfully
             class.try_to_class_literal_without_logging(&db).unwrap();
 
@@ -2024,6 +2070,7 @@ mod tests {
         // This makes the test far faster as it minimizes the number of times
         // we need to change the Python version in the loop.
         let mut classes: Vec<(KnownClass, PythonVersion)> = KnownClass::iter()
+            .filter(|&class| class != KnownClass::DjangoModel)
             .map(|class| {
                 let version_added = match class {
                     KnownClass::Template => PythonVersion::PY314,

@@ -30,6 +30,7 @@ use crate::{
             ClassInstanceFlags, ClassMemberResult, CodeGeneratorKind, DisjointBase,
             DynamicTypedDictLiteral, Field, FieldKind, InstanceMemberResult, MetaclassError,
             MetaclassErrorKind, MethodDecorator, MroLookup, NamedTupleField, SlotsKind,
+            django_model::django_manager_factory_base_type,
             synthesize_namedtuple_class_member,
             typed_dict::{TypedDictFields, synthesize_typed_dict_method, typed_dict_class_member},
         },
@@ -129,6 +130,16 @@ impl<'db> StaticClassLiteral<'db> {
                 !namedtuple.has_known_fields(db)
             }
             _ => false,
+        })
+    }
+
+    /// Return `true` if this class inherits from `django.db.models.Model`.
+    #[salsa::tracked(cycle_initial=|_, _, _| false, heap_size=ruff_memory_usage::heap_size)]
+    pub(crate) fn is_django_model(self, db: &'db dyn Db) -> bool {
+        self.iter_mro(db, None).any(|base| {
+            base.into_class()
+                .and_then(|c| c.static_class_literal(db))
+                .is_some_and(|(lit, _)| lit.is_known(db, KnownClass::DjangoModel))
         })
     }
 
@@ -398,8 +409,13 @@ impl<'db> StaticClassLiteral<'db> {
     /// ## Note
     /// Only call this function from queries in the same file or your
     /// query depends on the AST of another file (bad!).
-    fn node<'ast>(self, db: &'db dyn Db, module: &'ast ParsedModuleRef) -> &'ast ast::StmtClassDef {
-        self.body_scope(db).node(db).expect_class().node(module)
+    pub(super) fn node<'ast>(
+        self,
+        db: &'db dyn Db,
+        module: &'ast ParsedModuleRef,
+    ) -> &'ast ast::StmtClassDef {
+        let scope = self.body_scope(db);
+        scope.node(db).expect_class().node(module)
     }
 
     pub(crate) fn definition(self, db: &'db dyn Db) -> Definition<'db> {
@@ -1237,6 +1253,16 @@ impl<'db> StaticClassLiteral<'db> {
             {
                 return Member::definitely_declared(synthesized_member);
             }
+            if let Some(synthesized_member) =
+                super::django_model::synthesize_django_class_member(db, self, name)
+            {
+                return Member::definitely_declared(synthesized_member);
+            }
+            if let Some(synthesized_member) =
+                super::django_model::synthesize_inherited_django_manager_member(db, self, name)
+            {
+                return Member::definitely_declared(synthesized_member);
+            }
             // The symbol was not found in the class scope. It might still be implicitly defined in `@classmethod`s.
             return Self::implicit_attribute(db, body_scope, name, MethodDecorator::ClassMethod);
         }
@@ -1266,6 +1292,30 @@ impl<'db> StaticClassLiteral<'db> {
                 }
             }
         }
+
+        // TODO(astral-sh/ty#1018): This override is needed for instance access because
+        // attribute resolution combines class-body and instance-member results. As a
+        // side-effect, class-level access (e.g. `Article.title`) also returns the
+        // synthesized instance type rather than the descriptor. This is technically
+        // wrong but acceptable until class-vs-instance access can be distinguished.
+        if let Some(ty) =
+            super::django_model::synthesize_django_auth_boolean_instance_member(db, self, name)
+        {
+            return Member::definitely_declared(ty);
+        }
+        if let Some(ty) =
+            super::django_model::synthesize_django_field_instance_member(db, self, name)
+        {
+            return Member::definitely_declared(ty);
+        }
+
+        let member = member.map_type(|ty| {
+            super::django_model::specialize_declared_django_manager_class_member(db, self, name, ty)
+                .or_else(|| {
+                    super::django_model::specialize_declared_django_manager_member(db, self, ty)
+                })
+                .unwrap_or(ty)
+        });
 
         member
     }
@@ -2571,6 +2621,29 @@ impl<'db> StaticClassLiteral<'db> {
             return Member::unbound();
         }
 
+        // The well-known `AbstractUser`/`PermissionMixin` boolean attributes (`is_staff`,
+        // `is_active`, `is_superuser`) are real Django `BooleanField`s. Stubs frequently declare
+        // them with a placeholder annotation (e.g. `is_staff: object`), so this synthesis must run
+        // before field synthesis, which would otherwise claim such an annotation and shadow `bool`.
+        if let Some(ty) =
+            super::django_model::synthesize_django_auth_boolean_instance_member(db, self, name)
+        {
+            return Member::definitely_declared(ty);
+        }
+
+        // Some Django ecosystem decorators synthesize runtime QuerySet/Manager members.
+        if let Some(ty) =
+            super::django_model::synthesize_django_queryset_instance_member(db, self, name)
+        {
+            return Member::definitely_declared(ty);
+        }
+
+        // Django model fields are synthesized from AST-level field assignments
+        // (e.g. `title = CharField(...)`) rather than inferred from the descriptor type.
+        if let Some(ty) = super::django_model::synthesize_django_instance_member(db, self, name) {
+            return Member::definitely_declared(ty);
+        }
+
         let body_scope = self.body_scope(db);
         let table = place_table(db, body_scope);
 
@@ -2979,7 +3052,10 @@ pub(crate) fn expanded_class_base_entries<'a, 'db>(
                 let ty = if matches!(base_node, ast::Expr::Starred(_)) {
                     Type::unknown()
                 } else {
-                    definition_expression_type(db, class_definition, base_node)
+                    django_manager_factory_base_type(db, class_definition.file(db), base_node)
+                        .unwrap_or_else(|| {
+                            definition_expression_type(db, class_definition, base_node)
+                        })
                 };
                 expanded_bases.push(ExpandedClassBaseEntry {
                     source_node: base_node,
