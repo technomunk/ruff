@@ -117,6 +117,9 @@ use crate::types::visitor::{
     any_over_type, any_over_type_including_alias_arguments, dynamic_content,
 };
 use crate::{Db, FxOrderSet, HasType, NameKind, Program, SemanticModel};
+pub(crate) use class::django_model::{
+    django_filter_lookup_completions, django_lookup_string_completions,
+};
 pub(crate) use class::{ClassLiteral, ClassType, GenericAlias, StaticClassLiteral};
 pub use class::{KnownClass, MethodDecorator, SlotDescriptorType};
 use instance::Protocol;
