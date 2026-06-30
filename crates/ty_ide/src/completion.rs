@@ -9642,6 +9642,81 @@ author.<CURSOR>
         test.contains("books");
     }
 
+    /// Methods on a manager built with `Manager.from_queryset` (the base `QuerySet` API plus the
+    /// custom queryset methods) live in a synthesized protocol, so they must be enumerated for
+    /// completion even though they have no class-body declaration on the manager itself.
+    #[test]
+    fn django_manager_queryset_method_completions() {
+        let builder = CursorTest::builder()
+            .with_site_packages()
+            .site_packages("django/__init__.py", "")
+            .site_packages("django/db/__init__.py", "")
+            .site_packages(
+                "django/db/models/__init__.py",
+                r#"
+from django.db.models.base import Model
+from django.db.models.fields import CharField
+from django.db.models.manager import Manager
+from django.db.models.query import QuerySet
+"#,
+            )
+            .site_packages("django/db/models/base.py", "class Model: ...")
+            .site_packages(
+                "django/db/models/fields/__init__.py",
+                "class CharField:\n    def __init__(self, *, max_length: int = 255): ...",
+            )
+            .site_packages(
+                "django/db/models/query.py",
+                r#"
+from typing import Any, Generic, TypeVar
+_T = TypeVar("_T")
+class QuerySet(Generic[_T]):
+    def filter(self, **kwargs: Any) -> "QuerySet[_T]": ...
+    def prefetch_related(self, *args: Any) -> "QuerySet[_T]": ...
+    def all(self) -> "QuerySet[_T]": ...
+"#,
+            )
+            .site_packages(
+                "django/db/models/manager.py",
+                r#"
+from typing import Generic, TypeVar
+_T = TypeVar("_T")
+_M = TypeVar("_M", bound="Manager")
+class Manager(Generic[_T]):
+    @classmethod
+    def from_queryset(cls: type[_M], queryset_cls) -> type[_M]: ...
+    def get(self) -> _T: ...
+"#,
+            )
+            .source(
+                "main.py",
+                r#"
+from django.db.models import Model, CharField, Manager, QuerySet
+
+class ArticleQuerySet(QuerySet):
+    def visible(self) -> "ArticleQuerySet": ...
+
+ArticleManager = Manager.from_queryset(ArticleQuerySet)
+
+class Article(Model):
+    title = CharField(max_length=100)
+    objects = ArticleManager()
+
+Article.objects.<CURSOR>
+"#,
+            )
+            .completion_test_builder();
+        let test = builder.build();
+        // Base `QuerySet` methods copied onto the manager by `from_queryset`.
+        test.contains("filter");
+        test.contains("prefetch_related");
+        test.contains("all");
+        // Custom queryset methods exposed via `from_queryset`.
+        test.contains("visible");
+        // Methods declared directly on `Manager` remain available.
+        test.contains("get");
+    }
+
     #[test]
     fn auto_import_deprioritizes_deprecated_over_stdlib_special() {
         let builder = CursorTest::builder()

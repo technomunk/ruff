@@ -302,6 +302,24 @@ impl<'db> AllMembers<'db> {
                 }
             }
 
+            // Synthesized protocols (e.g. `Callable[...]`, or the queryset-method protocols ty
+            // synthesizes for Django managers) have no class body to walk, so the meta-type path
+            // below would miss their members. Enumerate the protocol's interface directly instead.
+            Type::ProtocolInstance(protocol) if protocol.to_nominal_instance().is_none() => {
+                for member in protocol.interface(db).members(db) {
+                    if let Place::Defined(DefinedPlace { ty: member_ty, .. }) =
+                        ty.member(db, member.name()).place
+                    {
+                        self.members.insert(Member {
+                            name: Name::new(member.name()),
+                            ty: member_ty,
+                        });
+                    }
+                }
+                // A protocol instance is still an object.
+                self.extend_with_type(db, Type::object());
+            }
+
             Type::LiteralValue(_)
             | Type::PropertyInstance(_)
             | Type::FunctionLiteral(_)
