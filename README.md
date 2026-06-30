@@ -1,4 +1,33 @@
 <!-- Begin section: Overview -->
+# Django-aware fork
+
+This fork was created to improve the Zed experience working with a Django (python) codebase. It is based off [Schiyoshi's work](https://github.com/sciyoshi/ruff/tree/django-support), extending on it.
+
+## To use this implementation with Zed:
+
+1. Clone the repo
+2. `cargo build --release --bin ty`
+3. Configure Zed to use ty (given the newly build binary)
+4. Profit
+
+## Zed configuration
+
+```json
+...
+"lsp": {
+  "ty": {
+    "binary": {
+      "path": "$PATH_TO_GIT_REPO/target/release/ty",
+      "arguments": ["server"],
+    },
+  },
+},
+"languages": {
+  "Python": {
+    "language_servers": ["ty", "ruff"],
+  },
+},
+```
 
 # Ruff
 
