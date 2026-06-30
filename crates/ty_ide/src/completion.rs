@@ -9497,6 +9497,151 @@ from collections import ChainMap as ChainMap
         ");
     }
 
+    /// Django synthesizes instance members that have no explicit declaration in the model body
+    /// (e.g. the `<relation>_id` accessor and `pk`). These resolve by name, but must also be
+    /// enumerated so they appear in completions.
+    #[test]
+    fn django_model_synthesized_instance_members() {
+        let builder = CursorTest::builder()
+            .with_site_packages()
+            .site_packages("django/__init__.py", "")
+            .site_packages("django/db/__init__.py", "")
+            .site_packages(
+                "django/db/models/__init__.py",
+                r#"
+from django.db.models.base import Model
+from django.db.models.fields import CharField
+from django.db.models.fields.related import ForeignKey
+"#,
+            )
+            .site_packages("django/db/models/base.py", "class Model: ...")
+            .site_packages(
+                "django/db/models/fields/__init__.py",
+                r#"
+from typing import Generic, TypeVar, overload
+
+_ST = TypeVar("_ST")
+_GT = TypeVar("_GT")
+
+class Field(Generic[_ST, _GT]):
+    @overload
+    def __get__(self, instance: None, owner: type) -> "Field[_ST, _GT]": ...
+    @overload
+    def __get__(self, instance: object, owner: type) -> _GT: ...
+    def __get__(self, instance, owner): ...
+    def __set__(self, instance: object, value: _ST) -> None: ...
+
+class CharField(Field[str, str]):
+    def __init__(self, *, max_length: int = 255): ...
+"#,
+            )
+            .site_packages(
+                "django/db/models/fields/related.py",
+                r#"
+from typing import Generic, TypeVar, overload
+
+_To = TypeVar("_To")
+
+class ForeignKey(Generic[_To]):
+    @overload
+    def __get__(self, instance: None, owner: type) -> "ForeignKey[_To]": ...
+    @overload
+    def __get__(self, instance: object, owner: type) -> _To: ...
+    def __get__(self, instance, owner): ...
+    def __init__(self, to: type, *, on_delete=None): ...
+"#,
+            )
+            .source(
+                "main.py",
+                r#"
+from django.db.models import Model, CharField, ForeignKey
+
+class Author(Model):
+    name = CharField(max_length=100)
+
+class Book(Model):
+    title = CharField(max_length=100)
+    author = ForeignKey(Author, on_delete=None)
+
+book = Book()
+book.<CURSOR>
+"#,
+            )
+            .completion_test_builder();
+
+        let test = builder.build();
+        // Fields declared in the class body are completed as before.
+        test.contains("title");
+        test.contains("author");
+        // Synthesized members with no class-body declaration are now enumerated too.
+        test.contains("author_id");
+        test.contains("pk");
+        test.contains("id");
+        // Non-relational fields don't grow an `_id` accessor.
+        test.not_contains("title_id");
+    }
+
+    /// A model targeted by a `ForeignKey` gains a reverse accessor (here named via `related_name`).
+    /// Like other synthesized members it resolves by name and must also be enumerated.
+    #[test]
+    fn django_model_reverse_relation_members() {
+        let builder = CursorTest::builder()
+            .with_site_packages()
+            .site_packages("django/__init__.py", "")
+            .site_packages("django/db/__init__.py", "")
+            .site_packages(
+                "django/db/models/__init__.py",
+                r#"
+from django.db.models.base import Model
+from django.db.models.fields import CharField
+from django.db.models.fields.related import ForeignKey
+from django.db.models.manager import Manager
+"#,
+            )
+            .site_packages("django/db/models/base.py", "class Model: ...")
+            .site_packages(
+                "django/db/models/fields/__init__.py",
+                "class CharField:\n    def __init__(self, *, max_length: int = 255): ...",
+            )
+            .site_packages(
+                "django/db/models/fields/related.py",
+                "class ForeignKey:\n    def __init__(self, to, *, on_delete, related_name: str | None = None): ...",
+            )
+            .site_packages(
+                "django/db/models/manager.py",
+                r#"
+from typing import Generic, TypeVar
+
+_T = TypeVar("_T")
+
+class Manager(Generic[_T]):
+    def get(self) -> _T: ...
+"#,
+            )
+            .source(
+                "main.py",
+                r#"
+from django.db.models import Model, CharField, ForeignKey
+
+class Author(Model):
+    name = CharField(max_length=100)
+
+class Book(Model):
+    author = ForeignKey(Author, on_delete=None, related_name="books")
+
+author = Author()
+author.<CURSOR>
+"#,
+            )
+            .completion_test_builder();
+
+        let test = builder.build();
+        // Own field.
+        test.contains("name");
+        // Reverse accessor synthesized from `Book.author`'s `related_name`.
+        test.contains("books");
+    }
+
     #[test]
     fn auto_import_deprioritizes_deprecated_over_stdlib_special() {
         let builder = CursorTest::builder()

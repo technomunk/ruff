@@ -5443,6 +5443,107 @@ impl<'db> StaticClassLiteral<'db> {
     }
 }
 
+/// Names of instance members that ty synthesizes for a Django model but that have no explicit
+/// declaration in the class body. Member *enumeration* (e.g. for completions) only walks declared
+/// members, so these synthesized names must be listed explicitly here; the caller resolves their
+/// types through the normal member-lookup path (so this only needs to produce candidate names).
+pub(crate) fn django_synthesized_instance_member_names<'db>(
+    db: &'db dyn Db,
+    class: StaticClassLiteral<'db>,
+) -> Vec<Name> {
+    if class.is_known(db, KnownClass::DjangoModel) || !class.is_django_model(db) {
+        return Vec::new();
+    }
+
+    let mut names = vec![Name::new_static("pk"), Name::new_static("id")];
+
+    let all_fields = collect_all_django_fields(db, class);
+    for field in all_fields.iter() {
+        // Relation fields expose a `<field>_id` accessor for the underlying column.
+        if relation_id_type_for_model(db, class, field).is_some() {
+            names.push(Name::new(format!("{}_id", field.name)));
+        }
+        // Date/datetime fields expose `get_next_by_<field>` / `get_previous_by_<field>`.
+        if matches!(
+            field.kind,
+            DjangoFieldKind::Date | DjangoFieldKind::DateTime
+        ) {
+            names.push(Name::new(format!("get_next_by_{}", field.name)));
+            names.push(Name::new(format!("get_previous_by_{}", field.name)));
+        }
+    }
+
+    for auth_name in ["is_staff", "is_active", "is_superuser"] {
+        if synthesize_django_auth_boolean_instance_member(db, class, auth_name).is_some() {
+            names.push(Name::new_static(auth_name));
+        }
+    }
+
+    names.extend(django_reverse_member_names(db, class));
+
+    names
+}
+
+/// Names of reverse-relation accessors synthesized on `class` (e.g. `book_set`, or an explicit
+/// `related_name`/`related_query_name`) by models elsewhere in the project that point a
+/// `ForeignKey`/`OneToOneField`/`ManyToManyField` at it. Mirrors the scopes searched by
+/// [`StaticClassLiteral::django_reverse_instance_member`] so enumerated names stay resolvable.
+fn django_reverse_member_names<'db>(db: &'db dyn Db, class: StaticClassLiteral<'db>) -> Vec<Name> {
+    if django_model_is_abstract(db, class) {
+        return Vec::new();
+    }
+
+    let file = class.file(db);
+    let mut names = Vec::new();
+
+    if let Some(models_module) = django_models_module_for_file(db, file) {
+        for member in django_reverse_members_in_models_module(db, models_module).iter() {
+            if member.target_model == class {
+                names.push(member.name.clone());
+            }
+        }
+    }
+    if let Some(top_level_package) = django_top_level_package_for_file(db, file) {
+        for member in django_reverse_members_in_top_level_package(db, top_level_package).iter() {
+            if member.target_model == class {
+                names.push(member.name.clone());
+            }
+        }
+        for member in django_reverse_members_in_project_search_path(db, top_level_package).iter() {
+            if member.target_model == class {
+                names.push(member.name.clone());
+            }
+        }
+    }
+
+    // Source models declared in the model's own module (covers projects where related models live
+    // in the same file rather than a dedicated `models` package).
+    if let Some(module) = file_to_module(db, file) {
+        for source_model in django_model_classes_in_module(db, module).iter().copied() {
+            if source_model == class {
+                continue;
+            }
+            for field in collect_all_django_relation_fields(db, source_model) {
+                if !matches!(
+                    field.kind,
+                    DjangoFieldKind::ForeignKey
+                        | DjangoFieldKind::OneToOne
+                        | DjangoFieldKind::ManyToMany
+                ) {
+                    continue;
+                }
+                if django_relation_targets_model(db, source_model, &field, class)
+                    && let Some(name) = reverse_related_name(db, source_model, &field)
+                {
+                    names.push(name);
+                }
+            }
+        }
+    }
+
+    names
+}
+
 pub(super) fn synthesize_django_auth_boolean_instance_member<'db>(
     db: &'db dyn Db,
     class: StaticClassLiteral<'db>,

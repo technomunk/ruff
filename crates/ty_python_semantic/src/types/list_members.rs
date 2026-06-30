@@ -587,6 +587,30 @@ impl<'db> AllMembers<'db> {
             }
             None => {}
         }
+
+        // Django models synthesize instance members (`<relation>_id`, `pk`, auth booleans, the
+        // `get_next_by_<date field>` navigators, ...) that have no explicit declaration in the
+        // class body, so the walk above misses them. Enumerate them here for instance access,
+        // resolving each type through the normal member-lookup path.
+        if ty.is_nominal_instance()
+            && let ClassLiteral::Static(static_class) = class_literal
+        {
+            for name in crate::types::class::django_model::django_synthesized_instance_member_names(
+                db,
+                static_class,
+            ) {
+                if let Place::Defined(DefinedPlace {
+                    ty: synthetic_member,
+                    ..
+                }) = ty.member(db, name.as_str()).place
+                {
+                    self.members.insert(Member {
+                        name,
+                        ty: synthetic_member,
+                    });
+                }
+            }
+        }
     }
 }
 
