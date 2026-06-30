@@ -583,6 +583,41 @@ impl<'db> SemanticModel<'db> {
         candidates
     }
 
+    /// Completion candidates for the string-literal lookup argument of a Django queryset method
+    /// (`select_related`/`prefetch_related`/`values`/`only`/`defer`/`order_by`/...).
+    ///
+    /// `receiver_ty` is the type of the method call's receiver and `typed_prefix` is the string
+    /// body typed before the cursor (used to walk any `field__field__` relation path). Returns
+    /// full lookup strings such as `author__name`.
+    pub fn django_lookup_string_completions(
+        &self,
+        receiver_ty: Type<'db>,
+        method_name: &str,
+        typed_prefix: &str,
+    ) -> Vec<String> {
+        crate::types::django_lookup_string_completions(
+            self.db,
+            receiver_ty,
+            method_name,
+            typed_prefix,
+        )
+    }
+
+    /// Completion candidates for the keyword-argument lookups of Django's `filter`/`exclude`/`get`
+    /// queryset methods (e.g. `filter(author__name__icontains=...)`).
+    ///
+    /// `receiver_ty` is the type of the method call's receiver and `typed_prefix` is the keyword
+    /// name typed before the cursor (used to walk any `field__field__` relation path). Returns full
+    /// lookup strings, including type-appropriate transform suffixes such as `name__icontains` or
+    /// `created__year`.
+    pub fn django_filter_lookup_completions(
+        &self,
+        receiver_ty: Type<'db>,
+        typed_prefix: &str,
+    ) -> Vec<String> {
+        crate::types::django_filter_lookup_completions(self.db, receiver_ty, typed_prefix)
+    }
+
     fn string_literal_completion_expected_type(
         &self,
         string_expr: &ast::ExprStringLiteral,

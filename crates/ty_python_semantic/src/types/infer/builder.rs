@@ -9402,9 +9402,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.django_selected_row_contains_item(row_ty, item_name)
     }
 
-    fn django_selected_fields_from_receiver_values_list<'expr>(
-        call_expression: &'expr ast::ExprCall,
-    ) -> Option<FxHashSet<&'expr str>> {
+    fn django_selected_fields_from_receiver_values_list(
+        call_expression: &ast::ExprCall,
+    ) -> Option<FxHashSet<&str>> {
         let ast::Expr::Attribute(method_attr) = call_expression.func.as_ref() else {
             return None;
         };
@@ -9444,7 +9444,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             _ => ty.nominal_class(db).is_some_and(|class| {
                 class
                     .iter_mro(db)
-                    .filter_map(|base| base.into_class())
+                    .filter_map(super::super::class_base::ClassBase::into_class)
                     .filter_map(|base| base.static_class_literal(db).map(|(base, _)| base))
                     .any(|base| {
                         matches!(
@@ -9476,7 +9476,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         actual_class
             .iter_mro(db)
-            .filter_map(|base| base.into_class())
+            .filter_map(super::super::class_base::ClassBase::into_class)
             .filter_map(|base| base.static_class_literal(db).map(|(base, _)| base))
             .any(|base| {
                 base == expected_lit
@@ -9507,7 +9507,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         ty.nominal_class(db).is_some_and(|class| {
             class
                 .iter_mro(db)
-                .filter_map(|base| base.into_class())
+                .filter_map(super::super::class_base::ClassBase::into_class)
                 .filter_map(|base| base.static_class_literal(db).map(|(base, _)| base))
                 .any(|base| class_names.contains(&base.name(db).as_str()))
         })
@@ -9874,9 +9874,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         );
     }
 
-    fn literal_string_collection_items<'expr>(
-        expr: &'expr ast::Expr,
-    ) -> Option<(&'expr [ast::Expr], bool)> {
+    fn literal_string_collection_items(
+        expr: &ast::Expr,
+    ) -> Option<(&[ast::Expr], bool)> {
         match expr {
             ast::Expr::List(ast::ExprList { elts, .. })
             | ast::Expr::Tuple(ast::ExprTuple { elts, .. })
@@ -10277,7 +10277,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         for base in class
             .iter_mro(self.db())
-            .filter_map(|base| base.into_class())
+            .filter_map(super::super::class_base::ClassBase::into_class)
             .filter_map(|base| base.static_class_literal(self.db()).map(|(base, _)| base))
         {
             if class_name.is_none() {
@@ -10469,7 +10469,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         ty.nominal_class(self.db()).is_some_and(|class| {
             class
                 .iter_mro(self.db())
-                .filter_map(|base| base.into_class())
+                .filter_map(super::super::class_base::ClassBase::into_class)
                 .filter_map(|base| base.static_class_literal(self.db()).map(|(base, _)| base))
                 .any(|base| {
                     matches!(
@@ -10497,7 +10497,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         ty.nominal_class(self.db()).is_some_and(|class| {
             class
                 .iter_mro(self.db())
-                .filter_map(|base| base.into_class())
+                .filter_map(super::super::class_base::ClassBase::into_class)
                 .filter_map(|base| base.static_class_literal(self.db()).map(|(base, _)| base))
                 .any(|base| names.contains(&base.name(self.db()).as_str()))
         }) || Self::django_call_name(expr).is_some_and(|name| names.contains(&name))
@@ -10507,7 +10507,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         if let Some(class) = self.expression_type(expr).nominal_class(self.db()) {
             if let Some(name) = class
                 .iter_mro(self.db())
-                .filter_map(|base| base.into_class())
+                .filter_map(super::super::class_base::ClassBase::into_class)
                 .filter_map(|base| base.static_class_literal(self.db()).map(|(base, _)| base))
                 .map(|base| base.name(self.db()).to_string())
                 .next()
@@ -10894,7 +10894,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 annotations.push((keyword_name.as_str().to_string(), &keyword.value));
             } else {
                 annotations.extend(self.django_annotation_items_from_splat(&keyword.value));
-            };
+            }
 
             for (annotation_name, annotation_value) in annotations {
                 if !seen_annotation_names.insert(annotation_name.clone()) {
@@ -10994,9 +10994,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
     }
 
-    fn django_prefetch_queryset_expression<'expr>(
-        call: &'expr ast::ExprCall,
-    ) -> Option<&'expr ast::Expr> {
+    fn django_prefetch_queryset_expression(
+        call: &ast::ExprCall,
+    ) -> Option<&ast::Expr> {
         call.arguments
             .keywords
             .iter()

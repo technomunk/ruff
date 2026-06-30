@@ -1309,15 +1309,15 @@ impl<'db> StaticClassLiteral<'db> {
             return Member::definitely_declared(ty);
         }
 
-        let member = member.map_type(|ty| {
+        
+
+        member.map_type(|ty| {
             super::django_model::specialize_declared_django_manager_class_member(db, self, name, ty)
                 .or_else(|| {
                     super::django_model::specialize_declared_django_manager_member(db, self, ty)
                 })
                 .unwrap_or(ty)
-        });
-
-        member
+        })
     }
 
     /// Returns the type of a synthesized dataclass member like `__init__` or `__lt__`, or

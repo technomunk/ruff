@@ -100,7 +100,7 @@ fn is_django_settings_instance(db: &dyn Db, ty: Type) -> bool {
     ty.nominal_class(db).is_some_and(|class| {
         class
             .iter_mro(db)
-            .filter_map(|base| base.into_class())
+            .filter_map(super::super::class_base::ClassBase::into_class)
             .filter_map(|base| base.static_class_literal(db).map(|(base, _)| base))
             .any(|base| {
                 matches!(base.name(db).as_str(), "LazySettings" | "Settings")
@@ -119,7 +119,7 @@ fn module_name_ends_with_settings(db: &dyn Db, module: Module) -> bool {
 }
 
 #[salsa::tracked(returns(deref), heap_size=ruff_memory_usage::heap_size)]
-fn django_project_settings_modules<'db>(db: &'db dyn Db, file: File) -> Box<[Module<'db>]> {
+fn django_project_settings_modules(db: &dyn Db, file: File) -> Box<[Module<'_>]> {
     if file_to_module(db, file).is_none() {
         return Box::default();
     }
@@ -189,7 +189,7 @@ fn django_settings_module_string_literal_member<'db>(
     None
 }
 
-fn django_settings_modules_imported_by_file<'db>(db: &'db dyn Db, file: File) -> Vec<Module<'db>> {
+fn django_settings_modules_imported_by_file(db: &dyn Db, file: File) -> Vec<Module<'_>> {
     let module = parsed_module(db, file).load(db);
     let mut modules = Vec::new();
 
@@ -261,7 +261,7 @@ pub(crate) fn is_django_querydict_instance(db: &dyn Db, ty: Type) -> bool {
     ty.nominal_class(db).is_some_and(|class| {
         class
             .iter_mro(db)
-            .filter_map(|base| base.into_class())
+            .filter_map(super::super::class_base::ClassBase::into_class)
             .filter_map(|base| base.static_class_literal(db).map(|(base, _)| base))
             .any(|base| {
                 base.name(db).as_str() == "QueryDict"
@@ -624,7 +624,7 @@ fn is_django_form_field_instance(db: &dyn Db, ty: Type) -> bool {
     ty.nominal_class(db).is_some_and(|class| {
         class
             .iter_mro(db)
-            .filter_map(|base| base.into_class())
+            .filter_map(super::super::class_base::ClassBase::into_class)
             .filter_map(|base| base.static_class_literal(db).map(|(base, _)| base))
             .any(|base| {
                 base.name(db).as_str() == "Field"
@@ -681,7 +681,7 @@ fn is_manager_instance<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
 
     class
         .iter_mro(db)
-        .filter_map(|base| base.into_class())
+        .filter_map(super::super::class_base::ClassBase::into_class)
         .filter_map(|base| base.static_class_literal(db).map(|(base, _)| base))
         .any(|base| is_django_manager_class(db, base))
 }
@@ -718,7 +718,7 @@ pub(crate) fn is_django_queryset_instance(db: &dyn Db, ty: Type) -> bool {
     ty.nominal_class(db).is_some_and(|class| {
         class
             .iter_mro(db)
-            .filter_map(|base| base.into_class())
+            .filter_map(super::super::class_base::ClassBase::into_class)
             .filter_map(|base| base.static_class_literal(db).map(|(base, _)| base))
             .any(|base| {
                 base.name(db).as_str() == "QuerySet"
@@ -767,7 +767,7 @@ fn is_django_queryset_or_manager_subclass<'db>(
 
     class
         .iter_mro(db, None)
-        .filter_map(|base| base.into_class())
+        .filter_map(super::super::class_base::ClassBase::into_class)
         .filter_map(|base| base.static_class_literal(db).map(|(base, _)| base))
         .any(|base| {
             matches!(
@@ -816,7 +816,7 @@ fn has_cacheops_hint_decorator<'db>(db: &'db dyn Db, class: StaticClassLiteral<'
 fn has_cacheops_hint_in_mro<'db>(db: &'db dyn Db, class: StaticClassLiteral<'db>) -> bool {
     class
         .iter_mro(db, None)
-        .filter_map(|base| base.into_class())
+        .filter_map(super::super::class_base::ClassBase::into_class)
         .filter_map(|base| base.static_class_literal(db).map(|(base, _)| base))
         .any(|base| has_cacheops_hint_decorator(db, base))
 }
@@ -1122,7 +1122,7 @@ pub(crate) fn django_values_list_all_fields_row_type<'db>(
             return None;
         }
         let fields = collect_all_django_fields(db, model_class);
-        return Some(resolve_pk_lookup_type(db, &fields));
+        return Some(resolve_pk_lookup_type(db, fields));
     }
 
     let row_types = django_values_list_all_fields_columns(db, model_instance)?
@@ -1143,7 +1143,7 @@ pub(crate) fn django_values_list_all_fields_columns<'db>(
     let fields = collect_all_django_fields(db, model_class);
     let mut columns = Vec::with_capacity(fields.len() + 1);
     if !fields.iter().any(|field| field.primary_key) {
-        columns.push((Name::new("id"), resolve_pk_lookup_type(db, &fields)));
+        columns.push((Name::new("id"), resolve_pk_lookup_type(db, fields)));
     }
     columns.extend(
         fields
@@ -1183,7 +1183,7 @@ pub(crate) fn django_model_init_positional_field_names<'db>(
 
     Some(
         collect_all_django_fields(db, model_class)
-            .into_iter()
+            .iter()
             .filter(|field| !matches!(field.kind, DjangoFieldKind::ManyToMany))
             .map(|field| field.name.clone())
             .collect(),
@@ -1237,7 +1237,7 @@ fn django_field_class_instance_type<'db>(
                 _ => &["django.db.models", "django.db.models.fields"][..],
             };
             module_names.iter().find_map(|module_name| {
-                resolve_django_symbol(db, file, *module_name, class_name)
+                resolve_django_symbol(db, file, module_name, class_name)
                     .and_then(|ty| ty.to_instance(db))
             })
         })
@@ -1368,10 +1368,10 @@ fn django_reverse_member_by_name<'db>(
             ) {
                 continue;
             }
-            if django_relation_targets_model(db, source_model, &field, target_model)
-                && reverse_related_name(db, source_model, &field) == Some(name.clone())
+            if django_relation_targets_model(db, source_model, field, target_model)
+                && reverse_related_name(db, source_model, field) == Some(name.clone())
             {
-                let Some(query_name) = reverse_related_query_name(db, source_model, &field) else {
+                let Some(query_name) = reverse_related_query_name(db, source_model, field) else {
                     continue;
                 };
                 return Some(DjangoReverseMemberInfo {
@@ -1936,7 +1936,6 @@ pub(crate) fn django_queryset_instance_for_reverse_manager<'db>(
             top_level_package,
             reverse_member_name.clone(),
         )
-        .iter()
         {
             if reverse_member.target_model == target_model
                 && matches!(
@@ -1954,12 +1953,11 @@ pub(crate) fn django_queryset_instance_for_reverse_manager<'db>(
     }
 
     if let Some(models_module) = django_models_module_for_file(db, target_model.file(db)) {
-        for reverse_member in django_reverse_members_named_in_models_module(
+        for reverse_member in &django_reverse_members_named_in_models_module(
             db,
             models_module,
             reverse_member_name.clone(),
         )
-        .iter()
         {
             if reverse_member.target_model == target_model
                 && matches!(
@@ -1991,7 +1989,7 @@ pub(crate) fn django_queryset_instance_for_reverse_manager<'db>(
             ) {
                 continue;
             }
-            if django_relation_targets_model(db, source_model, &field, target_model)
+            if django_relation_targets_model(db, source_model, field, target_model)
                 && reverse_related_name(db, source_model, field)
                     == Some(reverse_member_name.clone())
             {
@@ -2335,7 +2333,7 @@ fn django_app_label_for_file(db: &dyn Db, file: File) -> Option<String> {
     None
 }
 
-fn django_models_module_for_file<'db>(db: &'db dyn Db, file: File) -> Option<Module<'db>> {
+fn django_models_module_for_file(db: &dyn Db, file: File) -> Option<Module<'_>> {
     let module = file_to_module(db, file)?;
     let components: Vec<_> = module.name(db).components().collect();
     let models_index = components
@@ -2346,7 +2344,7 @@ fn django_models_module_for_file<'db>(db: &'db dyn Db, file: File) -> Option<Mod
     resolve_module(db, file, &models_module_name)
 }
 
-fn django_top_level_package_for_file<'db>(db: &'db dyn Db, file: File) -> Option<Module<'db>> {
+fn django_top_level_package_for_file(db: &dyn Db, file: File) -> Option<Module<'_>> {
     let module = file_to_module(db, file)?;
     let top_level_name = module.name(db).components().next()?;
     let top_level_name = ModuleName::new(top_level_name)?;
@@ -2412,7 +2410,7 @@ fn collect_django_model_modules_under<'db>(
     }
 
     if module.file(db).is_none() {
-        for &listed_module in list_modules(db).iter() {
+        for &listed_module in list_modules(db) {
             if listed_module == module || !module_is_under_module(db, listed_module, module) {
                 continue;
             }
@@ -2444,7 +2442,7 @@ fn collect_django_project_model_modules_under<'db>(
     }
 
     if module.file(db).is_none() {
-        for &listed_module in list_modules(db).iter() {
+        for &listed_module in list_modules(db) {
             if listed_module == module || !module_is_under_module(db, listed_module, module) {
                 continue;
             }
@@ -2469,7 +2467,7 @@ fn collect_django_project_model_modules<'db>(
         return;
     };
 
-    for &module in list_modules(db).iter() {
+    for &module in list_modules(db) {
         if module.search_path(db) != Some(anchor_search_path) {
             continue;
         }
@@ -2539,7 +2537,7 @@ fn django_model_modules_in_search_path<'db>(
     };
 
     let mut modules = Vec::new();
-    for &module in list_modules(db).iter() {
+    for &module in list_modules(db) {
         if module.search_path(db) == Some(anchor_search_path) && module_is_top_level(db, module) {
             modules.extend_from_slice(django_model_modules_under_top_level_package(db, module));
         }
@@ -2631,7 +2629,7 @@ fn class_base_may_be_django_model(base: &ast::Expr) -> bool {
     cycle_initial=|_, _, _| Box::default(),
     heap_size=ruff_memory_usage::heap_size
 )]
-fn django_model_modules_imported_by_file<'db>(db: &'db dyn Db, file: File) -> Box<[Module<'db>]> {
+fn django_model_modules_imported_by_file(db: &dyn Db, file: File) -> Box<[Module<'_>]> {
     collect_django_model_modules_imported_by_file(db, file, false).into_boxed_slice()
 }
 
@@ -2640,18 +2638,18 @@ fn django_model_modules_imported_by_file<'db>(db: &'db dyn Db, file: File) -> Bo
     cycle_initial=|_, _, _| Box::default(),
     heap_size=ruff_memory_usage::heap_size
 )]
-fn third_party_django_model_modules_imported_by_file<'db>(
-    db: &'db dyn Db,
+fn third_party_django_model_modules_imported_by_file(
+    db: &dyn Db,
     file: File,
-) -> Box<[Module<'db>]> {
+) -> Box<[Module<'_>]> {
     collect_django_model_modules_imported_by_file(db, file, true).into_boxed_slice()
 }
 
-fn collect_django_model_modules_imported_by_file<'db>(
-    db: &'db dyn Db,
+fn collect_django_model_modules_imported_by_file(
+    db: &dyn Db,
     file: File,
     skip_project_code: bool,
-) -> Vec<Module<'db>> {
+) -> Vec<Module<'_>> {
     let module = parsed_module(db, file).load(db);
     let mut modules = Vec::new();
 
@@ -3184,14 +3182,14 @@ fn django_reverse_members_in_models_module<'db>(
                     continue;
                 }
 
-                let target_model = target_model_for_relation_field(db, source_model, &field);
+                let target_model = target_model_for_relation_field(db, source_model, field);
                 let Some(target_model) = target_model else {
                     continue;
                 };
-                let Some(name) = reverse_related_name(db, source_model, &field) else {
+                let Some(name) = reverse_related_name(db, source_model, field) else {
                     continue;
                 };
-                let Some(query_name) = reverse_related_query_name(db, source_model, &field) else {
+                let Some(query_name) = reverse_related_query_name(db, source_model, field) else {
                     continue;
                 };
 
@@ -3235,15 +3233,15 @@ fn django_reverse_members_named_in_models_module<'db>(
                 ) {
                     continue;
                 }
-                if reverse_related_name(db, source_model, &field) != Some(name.clone()) {
+                if reverse_related_name(db, source_model, field) != Some(name.clone()) {
                     continue;
                 }
 
-                let target_model = target_model_for_relation_field(db, source_model, &field);
+                let target_model = target_model_for_relation_field(db, source_model, field);
                 let Some(target_model) = target_model else {
                     continue;
                 };
-                let Some(query_name) = reverse_related_query_name(db, source_model, &field) else {
+                let Some(query_name) = reverse_related_query_name(db, source_model, field) else {
                     continue;
                 };
 
@@ -3293,16 +3291,16 @@ fn django_reverse_members_query_named_in_models_module<'db>(
                 ) {
                     continue;
                 }
-                if reverse_related_query_name(db, source_model, &field) != Some(query_name.clone())
+                if reverse_related_query_name(db, source_model, field) != Some(query_name.clone())
                 {
                     continue;
                 }
 
-                let target_model = target_model_for_relation_field(db, source_model, &field);
+                let target_model = target_model_for_relation_field(db, source_model, field);
                 let Some(target_model) = target_model else {
                     continue;
                 };
-                let Some(name) = reverse_related_name(db, source_model, &field) else {
+                let Some(name) = reverse_related_name(db, source_model, field) else {
                     continue;
                 };
 
@@ -3495,12 +3493,12 @@ fn module_path_contains_component(db: &dyn Db, module: Module, component: &str) 
 }
 
 #[salsa::tracked(cycle_initial=|_, _, _, _, _| None)]
-fn django_model_named_in_project_app_label<'db>(
-    db: &'db dyn Db,
+fn django_model_named_in_project_app_label(
+    db: &dyn Db,
     file: File,
     app_label: Name,
     model_name: Name,
-) -> Option<StaticClassLiteral<'db>> {
+) -> Option<StaticClassLiteral<'_>> {
     let anchor_module = django_top_level_package_for_file(db, file)?;
 
     let mut matching_model = None;
@@ -3529,11 +3527,11 @@ fn django_model_named_in_project_app_label<'db>(
 }
 
 #[salsa::tracked(cycle_initial=|_, _, _, _| None)]
-fn django_model_named_in_project<'db>(
-    db: &'db dyn Db,
+fn django_model_named_in_project(
+    db: &dyn Db,
     file: File,
     model_name: Name,
-) -> Option<StaticClassLiteral<'db>> {
+) -> Option<StaticClassLiteral<'_>> {
     let anchor_module = django_top_level_package_for_file(db, file)?;
 
     let mut matching_model = None;
@@ -3815,13 +3813,13 @@ fn resolve_dotted_model_reference<'db>(db: &'db dyn Db, file: File, value: &str)
     Type::unknown()
 }
 
-pub(crate) fn resolve_auth_user_model_reference<'db>(db: &'db dyn Db, file: File) -> Type<'db> {
+pub(crate) fn resolve_auth_user_model_reference(db: &dyn Db, file: File) -> Type<'_> {
     django_auth_user_model_class(db, file)
         .map(|user_model| Type::instance(db, user_model.apply_optional_specialization(db, None)))
         .unwrap_or_else(Type::unknown)
 }
 
-fn django_settings_string_member<'db>(db: &'db dyn Db, file: File, name: &str) -> Option<String> {
+fn django_settings_string_member(db: &dyn Db, file: File, name: &str) -> Option<String> {
     for module in django_settings_modules_imported_by_file(db, file) {
         if let Some(value) = django_settings_module_string_literal_member(db, module, name) {
             return Some(value);
@@ -3850,10 +3848,10 @@ fn django_settings_string_member<'db>(db: &'db dyn Db, file: File, name: &str) -
 }
 
 #[salsa::tracked(cycle_initial=|_, _, _| None)]
-fn django_auth_user_model_class<'db>(
-    db: &'db dyn Db,
+fn django_auth_user_model_class(
+    db: &dyn Db,
     file: File,
-) -> Option<StaticClassLiteral<'db>> {
+) -> Option<StaticClassLiteral<'_>> {
     if let Some(auth_user_model) = django_settings_string_member(db, file, "AUTH_USER_MODEL") {
         let resolved_model = resolve_dotted_model_reference(db, file, &auth_user_model);
         let resolved_class = static_class_from_instance(db, resolved_model);
@@ -4072,7 +4070,7 @@ fn direct_concrete_django_model_bases<'db>(
 
     class
         .iter_mro(db, None)
-        .filter_map(|base| base.into_class())
+        .filter_map(super::super::class_base::ClassBase::into_class)
         .filter_map(|base| base.static_class_literal(db).map(|(base, _)| base))
         .filter(|base| *base != class)
         .filter(|base| {
@@ -4227,7 +4225,7 @@ fn relation_id_type<'db>(db: &'db dyn Db, field: &DjangoFieldInfo<'db>) -> Optio
             }
             .instance_type(db)
         })
-        .unwrap_or_else(|| resolve_pk_type(db, &related_fields));
+        .unwrap_or_else(|| resolve_pk_type(db, related_fields));
 
     Some(if field.nullable {
         UnionType::from_two_elements(db, id_type, Type::none(db))
@@ -4277,7 +4275,7 @@ fn relation_id_type_for_model<'db>(
             }
             .instance_type_for_model(db, related_class)
         })
-        .unwrap_or_else(|| resolve_pk_type(db, &related_fields));
+        .unwrap_or_else(|| resolve_pk_type(db, related_fields));
 
     Some(if field.nullable {
         UnionType::from_two_elements(db, id_type, Type::none(db))
@@ -4323,7 +4321,7 @@ fn relation_id_lookup_type_for_model<'db>(
             }
             .lookup_exact_type(db)
         })
-        .unwrap_or_else(|| resolve_pk_lookup_type(db, &related_fields));
+        .unwrap_or_else(|| resolve_pk_lookup_type(db, related_fields));
 
     Some(UnionType::from_two_elements(db, id_type, Type::none(db)))
 }
@@ -4339,7 +4337,7 @@ fn many_to_many_lookup_type<'db>(
 
     let related_class = lazy_target_model_for_relation_field(db, model_class, field)?;
     let related_model = Type::instance(db, related_class.apply_optional_specialization(db, None));
-    let related_pk_type = resolve_pk_lookup_type(db, &collect_all_django_fields(db, related_class));
+    let related_pk_type = resolve_pk_lookup_type(db, collect_all_django_fields(db, related_class));
     Some(UnionType::from_elements(
         db,
         [related_model, related_pk_type, Type::none(db)],
@@ -4391,13 +4389,13 @@ fn django_model_lookup_path_type<'db>(
 
     let all_fields = collect_all_django_fields(db, class);
     let (field_type, related_class) = match *head {
-        "pk" => (resolve_pk_lookup_type(db, &all_fields), None),
+        "pk" => (resolve_pk_lookup_type(db, all_fields), None),
         "id" => {
             let ty = all_fields
                 .iter()
                 .find(|field| field.name.as_str() == "id")
                 .map(|field| field.lookup_exact_type(db))
-                .unwrap_or_else(|| resolve_pk_lookup_type(db, &all_fields));
+                .unwrap_or_else(|| resolve_pk_lookup_type(db, all_fields));
             (ty, None)
         }
         name => {
@@ -4511,7 +4509,6 @@ fn django_reverse_query_source_model<'db>(
             top_level_package,
             reverse_member_name.clone(),
         )
-        .iter()
         {
             if reverse_member_matches(reverse_member) {
                 return Some(reverse_member.source_model);
@@ -4523,7 +4520,6 @@ fn django_reverse_query_source_model<'db>(
             top_level_package,
             reverse_member_name.clone(),
         )
-        .iter()
         {
             if reverse_member_matches(reverse_member) {
                 return Some(reverse_member.source_model);
@@ -4537,7 +4533,6 @@ fn django_reverse_query_source_model<'db>(
             models_module,
             reverse_member_name.clone(),
         )
-        .iter()
         {
             if reverse_member_matches(reverse_member) {
                 return Some(reverse_member.source_model);
@@ -4563,8 +4558,8 @@ fn django_reverse_query_source_model<'db>(
             {
                 continue;
             }
-            if django_relation_targets_model(db, source_model, &field, target_model)
-                && reverse_related_query_name(db, source_model, &field)
+            if django_relation_targets_model(db, source_model, field, target_model)
+                && reverse_related_query_name(db, source_model, field)
                     == Some(reverse_member_name.clone())
             {
                 return Some(source_model);
@@ -5270,8 +5265,7 @@ impl<'db> StaticClassLiteral<'db> {
                 .any(|possible_name| possible_name == &name)
             {
                 for reverse_member in
-                    django_reverse_members_named_in_models_module(db, models_module, name.clone())
-                        .iter()
+                    &django_reverse_members_named_in_models_module(db, models_module, name.clone())
                 {
                     if reverse_member.target_model != self || reverse_member.name != name {
                         continue;
@@ -5293,7 +5287,6 @@ impl<'db> StaticClassLiteral<'db> {
                     top_level_package,
                     name.clone(),
                 )
-                .iter()
                 {
                     if reverse_member.target_model != self || reverse_member.name != name {
                         continue;
@@ -5311,7 +5304,7 @@ impl<'db> StaticClassLiteral<'db> {
         } else {
             django_model_modules_imported_by_file(db, self.file(db))
         };
-        for module in imported_modules.iter() {
+        for module in imported_modules {
             if !possible_reverse_name_in_module(db, *module, &name)
                 && module_name_last_component(db, *module) != Some("models")
             {
@@ -5359,10 +5352,10 @@ impl<'db> StaticClassLiteral<'db> {
                         ) {
                             continue;
                         }
-                        if !django_relation_targets_model(db, source_model, &field, self) {
+                        if !django_relation_targets_model(db, source_model, field, self) {
                             continue;
                         }
-                        if reverse_related_name(db, source_model, &field) != Some(name.clone()) {
+                        if reverse_related_name(db, source_model, field) != Some(name.clone()) {
                             continue;
                         }
 
@@ -5398,10 +5391,10 @@ impl<'db> StaticClassLiteral<'db> {
                     ) {
                         continue;
                     }
-                    if !django_relation_targets_model(db, source_model, &field, self) {
+                    if !django_relation_targets_model(db, source_model, field, self) {
                         continue;
                     }
-                    if reverse_related_name(db, source_model, &field) != Some(name.clone()) {
+                    if reverse_related_name(db, source_model, field) != Some(name.clone()) {
                         continue;
                     }
 
@@ -5429,7 +5422,6 @@ impl<'db> StaticClassLiteral<'db> {
                 top_level_package,
                 name.clone(),
             )
-            .iter()
             {
                 if reverse_member.target_model != self || reverse_member.name != name {
                     continue;
@@ -5458,7 +5450,7 @@ pub(crate) fn django_synthesized_instance_member_names<'db>(
     let mut names = vec![Name::new_static("pk"), Name::new_static("id")];
 
     let all_fields = collect_all_django_fields(db, class);
-    for field in all_fields.iter() {
+    for field in all_fields {
         // Relation fields expose a `<field>_id` accessor for the underlying column.
         if relation_id_type_for_model(db, class, field).is_some() {
             names.push(Name::new(format!("{}_id", field.name)));
@@ -5497,19 +5489,19 @@ fn django_reverse_member_names<'db>(db: &'db dyn Db, class: StaticClassLiteral<'
     let mut names = Vec::new();
 
     if let Some(models_module) = django_models_module_for_file(db, file) {
-        for member in django_reverse_members_in_models_module(db, models_module).iter() {
+        for member in django_reverse_members_in_models_module(db, models_module) {
             if member.target_model == class {
                 names.push(member.name.clone());
             }
         }
     }
     if let Some(top_level_package) = django_top_level_package_for_file(db, file) {
-        for member in django_reverse_members_in_top_level_package(db, top_level_package).iter() {
+        for member in django_reverse_members_in_top_level_package(db, top_level_package) {
             if member.target_model == class {
                 names.push(member.name.clone());
             }
         }
-        for member in django_reverse_members_in_project_search_path(db, top_level_package).iter() {
+        for member in django_reverse_members_in_project_search_path(db, top_level_package) {
             if member.target_model == class {
                 names.push(member.name.clone());
             }
@@ -5532,8 +5524,8 @@ fn django_reverse_member_names<'db>(db: &'db dyn Db, class: StaticClassLiteral<'
                 ) {
                     continue;
                 }
-                if django_relation_targets_model(db, source_model, &field, class)
-                    && let Some(name) = reverse_related_name(db, source_model, &field)
+                if django_relation_targets_model(db, source_model, field, class)
+                    && let Some(name) = reverse_related_name(db, source_model, field)
                 {
                     names.push(name);
                 }
@@ -5542,6 +5534,247 @@ fn django_reverse_member_names<'db>(db: &'db dyn Db, class: StaticClassLiteral<'
     }
 
     names
+}
+
+/// Completion candidates for the string-literal lookup argument of a Django queryset method.
+///
+/// `receiver_ty` is the type of the call's receiver (a manager or queryset). `method_name`
+/// selects whether relation paths (`select_related`/`prefetch_related`) or field-or-relation paths
+/// (`values`/`values_list`/`only`/`defer`/`order_by`/`distinct`) are offered. `typed_prefix` is the
+/// string body already typed before the cursor; any leading `field__field__` segments form a
+/// relation path that is walked so the trailing (partial) segment is completed against the right
+/// model. Returns full lookup strings (e.g. `author__name`); the client fuzzy-filters them.
+pub(crate) fn django_lookup_string_completions<'db>(
+    db: &'db dyn Db,
+    receiver_ty: Type<'db>,
+    method_name: &str,
+    typed_prefix: &str,
+) -> Vec<String> {
+    let relations_only = match method_name {
+        "select_related" | "prefetch_related" => true,
+        "values" | "values_list" | "only" | "defer" | "order_by" | "distinct" => false,
+        _ => return Vec::new(),
+    };
+
+    let Some(model_instance) = model_instance_from_django_queryset_like(db, receiver_ty) else {
+        return Vec::new();
+    };
+    let Some(model_class) = static_class_from_instance(db, model_instance) else {
+        return Vec::new();
+    };
+
+    // `order_by` accepts a leading `-` for descending order; preserve it on the suggestions.
+    let (sign, body) = typed_prefix
+        .strip_prefix('-')
+        .map_or(("", typed_prefix), |rest| ("-", rest));
+
+    // Everything before the final `__` is a relation path that must be walked; the trailing
+    // segment is the (partial) name being completed and is left to the client's fuzzy filter.
+    let (path_str, _partial) = body.rsplit_once("__").unwrap_or(("", body));
+    let mut current = model_class;
+    if !path_str.is_empty() {
+        for segment in path_str.split("__") {
+            let Some(next) = django_relation_target_by_name(db, current, segment) else {
+                return Vec::new();
+            };
+            current = next;
+        }
+    }
+
+    let prefix = if path_str.is_empty() {
+        String::new()
+    } else {
+        format!("{path_str}__")
+    };
+
+    let mut names: Vec<String> = Vec::new();
+    if relations_only {
+        for field in collect_all_django_relation_fields(db, current) {
+            if matches!(
+                field.kind,
+                DjangoFieldKind::ForeignKey
+                    | DjangoFieldKind::OneToOne
+                    | DjangoFieldKind::ManyToMany
+            ) {
+                names.push(field.name.as_str().to_string());
+            }
+        }
+        for name in django_reverse_member_names(db, current) {
+            names.push(name.as_str().to_string());
+        }
+    } else {
+        for field in collect_all_django_fields(db, current) {
+            names.push(field.name.as_str().to_string());
+        }
+    }
+
+    names.sort_unstable();
+    names.dedup();
+    names
+        .into_iter()
+        .map(|name| format!("{sign}{prefix}{name}"))
+        .collect()
+}
+
+/// Completion candidates for the keyword-argument lookups of Django's `filter`/`exclude`/`get`
+/// (and related) queryset methods, e.g. `filter(author__name__icontains=...)`.
+///
+/// This is the enumerating inverse of Django lookup *validation*: any leading `field__field`
+/// segments of `typed_prefix` are walked as a relation path, and the resolved leaf model's fields
+/// and relations are offered — fields additionally suffixed with the lookup transforms that apply
+/// to their type (`__gte`, `__icontains`, `__year`, `__isnull`, ...). Returns full lookup strings;
+/// the client fuzzy-filters them against what the user has typed.
+pub(crate) fn django_filter_lookup_completions<'db>(
+    db: &'db dyn Db,
+    receiver_ty: Type<'db>,
+    typed_prefix: &str,
+) -> Vec<String> {
+    let Some(model_instance) = model_instance_from_django_queryset_like(db, receiver_ty) else {
+        return Vec::new();
+    };
+    let Some(model_class) = static_class_from_instance(db, model_instance) else {
+        return Vec::new();
+    };
+
+    // Everything before the final `__` is a relation path that must be walked; the trailing
+    // segment is the (partial) name being completed and is left to the client's fuzzy filter.
+    let (path_str, _partial) = typed_prefix.rsplit_once("__").unwrap_or(("", typed_prefix));
+    let mut current = model_class;
+    if !path_str.is_empty() {
+        for segment in path_str.split("__") {
+            let Some(next) = django_relation_target_by_name(db, current, segment) else {
+                return Vec::new();
+            };
+            current = next;
+        }
+    }
+
+    let prefix = if path_str.is_empty() {
+        String::new()
+    } else {
+        format!("{path_str}__")
+    };
+
+    let mut candidates: Vec<String> = Vec::new();
+    for field in collect_all_django_fields(db, current) {
+        let name = field.name.as_str();
+        // The bare field/relation name (relations can be traversed further with `__`).
+        candidates.push(format!("{prefix}{name}"));
+        for suffix in django_field_lookup_suffixes(&field.kind) {
+            candidates.push(format!("{prefix}{name}__{suffix}"));
+        }
+    }
+
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
+/// The Django lookup-transform suffixes (without the leading `__`) that apply to a field of the
+/// given kind. Relation fields only expose the handful that operate on the relation itself; scalar
+/// fields build from a common set plus type-specific text / comparison / date-component transforms.
+fn django_field_lookup_suffixes(kind: &DjangoFieldKind) -> Vec<&'static str> {
+    if matches!(
+        kind,
+        DjangoFieldKind::ForeignKey
+            | DjangoFieldKind::OneToOne
+            | DjangoFieldKind::ManyToMany
+            | DjangoFieldKind::GenericForeignKey
+    ) {
+        return vec!["exact", "in", "isnull"];
+    }
+
+    let mut suffixes = vec!["exact", "in", "isnull"];
+
+    // Text lookups.
+    if matches!(kind, DjangoFieldKind::Char) {
+        suffixes.extend([
+            "iexact",
+            "contains",
+            "icontains",
+            "startswith",
+            "istartswith",
+            "endswith",
+            "iendswith",
+            "regex",
+            "iregex",
+        ]);
+    }
+
+    // Ordered comparisons / ranges.
+    if matches!(
+        kind,
+        DjangoFieldKind::Integer
+            | DjangoFieldKind::Float
+            | DjangoFieldKind::Decimal
+            | DjangoFieldKind::Auto
+            | DjangoFieldKind::Date
+            | DjangoFieldKind::DateTime
+            | DjangoFieldKind::Time
+    ) {
+        suffixes.extend(["gt", "gte", "lt", "lte", "range"]);
+    }
+
+    // Date / time component extraction.
+    if matches!(kind, DjangoFieldKind::Date | DjangoFieldKind::DateTime) {
+        suffixes.extend([
+            "year", "month", "day", "week", "week_day", "iso_year", "quarter",
+        ]);
+    }
+    if matches!(kind, DjangoFieldKind::DateTime) {
+        suffixes.extend(["date", "time", "hour", "minute", "second"]);
+    }
+    if matches!(kind, DjangoFieldKind::Time) {
+        suffixes.extend(["hour", "minute", "second"]);
+    }
+
+    suffixes
+}
+
+/// Resolves a Django model class from the type produced by accessing a relation field on an
+/// instance: the related model itself (`ForeignKey`/`OneToOneField`, possibly `... | None`), or the
+/// related manager/queryset of a `ManyToManyField`.
+fn django_model_class_from_related_type<'db>(
+    db: &'db dyn Db,
+    ty: Type<'db>,
+) -> Option<StaticClassLiteral<'db>> {
+    if let Type::Union(union) = ty {
+        return union
+            .elements(db)
+            .iter()
+            .find_map(|element| django_model_class_from_related_type(db, *element));
+    }
+    if let Some(class) =
+        static_class_from_instance(db, ty).filter(|class| class.is_django_model(db))
+    {
+        return Some(class);
+    }
+    model_instance_from_django_queryset_like(db, ty)
+        .and_then(|model| static_class_from_instance(db, model))
+}
+
+fn django_relation_target_by_name<'db>(
+    db: &'db dyn Db,
+    model_class: StaticClassLiteral<'db>,
+    name: &str,
+) -> Option<StaticClassLiteral<'db>> {
+    let fields = collect_all_django_relation_fields(db, model_class);
+    let field = fields.iter().find(|field| {
+        field.name.as_str() == name
+            && matches!(
+                field.kind,
+                DjangoFieldKind::ForeignKey
+                    | DjangoFieldKind::OneToOne
+                    | DjangoFieldKind::ManyToMany
+            )
+    })?;
+    if let Some(target) = target_model_for_relation_field(db, model_class, field) {
+        return Some(target);
+    }
+    // Fall back to the field's accessed instance type. The type system resolves the relation
+    // target via the field descriptor even when the target model isn't declared in a `models`
+    // module (which is all `target_model_for_relation_field` can resolve string references from).
+    django_model_class_from_related_type(db, field.instance_type_for_model(db, model_class))
 }
 
 pub(super) fn synthesize_django_auth_boolean_instance_member<'db>(
@@ -5557,7 +5790,7 @@ pub(super) fn synthesize_django_auth_boolean_instance_member<'db>(
 
     class
         .iter_mro(db, None)
-        .filter_map(|base| base.into_class())
+        .filter_map(super::super::class_base::ClassBase::into_class)
         .filter_map(|base| base.static_class_literal(db).map(|(base, _)| base))
         .any(|base| base.name(db).as_str() == expected_base)
         .then(|| KnownClass::Bool.to_instance(db))
@@ -5598,7 +5831,7 @@ fn synthesize_django_instance_member_impl<'db>(
     match name {
         "pk" => {
             let all_fields = collect_all_django_fields(db, class);
-            Some(resolve_pk_type(db, &all_fields))
+            Some(resolve_pk_type(db, all_fields))
         }
         "id" => {
             let all_fields = collect_all_django_fields(db, class);

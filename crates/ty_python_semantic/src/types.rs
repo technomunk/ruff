@@ -102,6 +102,9 @@ pub use crate::types::variance::TypeVarVariance;
 use crate::types::variance::VarianceInferable;
 use crate::types::visitor::any_over_type;
 use crate::{Db, FxOrderSet, Program};
+pub(crate) use class::django_model::{
+    django_filter_lookup_completions, django_lookup_string_completions,
+};
 pub(crate) use class::{ClassLiteral, ClassType, GenericAlias, StaticClassLiteral};
 pub use class::{KnownClass, MethodDecorator};
 use instance::Protocol;

@@ -58,6 +58,8 @@ pub fn completion<'db>(
             &mut completions,
         );
 
+        add_django_lookup_completions(&model, &context.cursor, string_expr, &mut completions);
+
         return completions.into_completions();
     }
 
@@ -95,6 +97,7 @@ pub fn completion<'db>(
                 }
                 add_keyword_completions(db, &mut completions);
                 add_argument_completions(db, &model, &context.cursor, &mut completions);
+                add_django_filter_kwarg_completions(&model, &context.cursor, &mut completions);
                 if settings.auto_import {
                     add_unimported_completions(
                         db,
@@ -2170,6 +2173,116 @@ fn add_string_literal_completions<'db>(
                 .ty(candidate.ty)
                 .context_specific(true),
         );
+    }
+}
+
+/// Adds Django queryset-method lookup completions for the string literal under the cursor.
+///
+/// When the cursor is inside a string argument of a method like `select_related`,
+/// `prefetch_related`, `values`, `only`, `defer`, or `order_by` on a Django manager/queryset, this
+/// offers the model's field/relation names — including `field__field` relation paths.
+fn add_django_lookup_completions<'db>(
+    model: &SemanticModel<'db>,
+    cursor: &ContextCursor<'_>,
+    string_expr: &ast::ExprStringLiteral,
+    completions: &mut Completions<'db>,
+) {
+    // The string literal must be an argument of a method call `<receiver>.<method>(... "<here>" )`.
+    let Some(call) = cursor
+        .covering_node
+        .ancestors()
+        .find_map(|node| match node {
+            ast::AnyNodeRef::ExprCall(call) => Some(call),
+            _ => None,
+        })
+    else {
+        return;
+    };
+    let ast::Expr::Attribute(method) = call.func.as_ref() else {
+        return;
+    };
+    let Some(receiver_ty) = method.value.inferred_type(model) else {
+        return;
+    };
+
+    // The portion of the string body already typed before the cursor; its leading `field__`
+    // segments form the relation path to walk before completing the trailing segment.
+    let start = string_expr.range().start().to_usize();
+    let end = cursor.offset.to_usize();
+    let Some(raw) = cursor.source.get(start..end) else {
+        return;
+    };
+    let typed_prefix = strip_string_opener(raw);
+
+    for value in
+        model.django_lookup_string_completions(receiver_ty, method.attr.as_str(), typed_prefix)
+    {
+        completions.add_skip_query(
+            Completion::builder(&value)
+                .insert(value.clone())
+                .context_specific(true),
+        );
+    }
+}
+
+/// Adds Django field-lookup completions for keyword-argument names in `filter`/`exclude`/`get`/
+/// `aget` calls on a Django manager/queryset, e.g. `qs.filter(author__name__icontains=...)`.
+///
+/// Detection mirrors [`add_argument_completions`]: walk up from the cursor, bail if it sits in a
+/// keyword-argument *value* position, and only act once we know we're inside a call's arguments.
+fn add_django_filter_kwarg_completions<'db>(
+    model: &SemanticModel<'db>,
+    cursor: &ContextCursor<'_>,
+    completions: &mut Completions<'db>,
+) {
+    let mut in_arguments = false;
+    for node in cursor.covering_node.ancestors() {
+        match node {
+            // The cursor is in a keyword-argument *value* (`name=<here>`), not a name; skip.
+            ast::AnyNodeRef::Keyword(kw) => {
+                if kw.value.range().contains_range(cursor.range) {
+                    return;
+                }
+            }
+            ast::AnyNodeRef::Arguments(_) => in_arguments = true,
+            ast::AnyNodeRef::ExprCall(call) => {
+                if !in_arguments {
+                    return;
+                }
+                let ast::Expr::Attribute(method) = call.func.as_ref() else {
+                    return;
+                };
+                if !matches!(method.attr.as_str(), "filter" | "exclude" | "get" | "aget") {
+                    return;
+                }
+                let Some(receiver_ty) = method.value.inferred_type(model) else {
+                    return;
+                };
+                // `django_filter_lookup_completions` returns an empty Vec for non-Django
+                // receivers, so this is a no-op for ordinary `.get(...)`/`.filter(...)` calls.
+                let typed_prefix = cursor.typed.unwrap_or("");
+                for lookup in model.django_filter_lookup_completions(receiver_ty, typed_prefix) {
+                    completions.add(CompletionBuilder::argument(lookup.as_str()));
+                }
+                return;
+            }
+            node => {
+                if node.is_statement() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Strips a string literal's prefix letters (e.g. `r`, `b`) and opening quote(s), returning the
+/// body text that follows.
+fn strip_string_opener(raw: &str) -> &str {
+    let after_prefix = raw
+        .trim_start_matches(['r', 'R', 'b', 'B', 'u', 'U', 'f', 'F']);
+    match after_prefix.chars().next() {
+        Some(quote @ ('"' | '\'')) => after_prefix.trim_start_matches(quote),
+        _ => after_prefix,
     }
 }
 
@@ -9715,6 +9828,214 @@ Article.objects.<CURSOR>
         test.contains("visible");
         // Methods declared directly on `Manager` remain available.
         test.contains("get");
+    }
+
+    /// Inside `filter`/`exclude`/`get`/`aget` on a Django manager/queryset, keyword-argument names
+    /// complete to field/relation lookups with transform suffixes (`__icontains`, `__gte`, ...),
+    /// including `field__field` relation traversal.
+    #[test]
+    fn django_filter_kwarg_completions() {
+        let run = |code: String| -> Vec<String> {
+            let builder = CursorTest::builder()
+                .with_site_packages()
+                .site_packages("django/__init__.py", "")
+                .site_packages("django/db/__init__.py", "")
+                .site_packages(
+                    "django/db/models/__init__.py",
+                    r#"
+from django.db.models.base import Model
+from django.db.models.fields import CharField, IntegerField
+from django.db.models.fields.related import ForeignKey
+from django.db.models.manager import Manager
+"#,
+                )
+                .site_packages("django/db/models/base.py", "class Model: ...")
+                .site_packages(
+                    "django/db/models/fields/__init__.py",
+                    r#"
+from typing import Generic, TypeVar, overload
+_ST = TypeVar("_ST")
+_GT = TypeVar("_GT")
+class Field(Generic[_ST, _GT]):
+    @overload
+    def __get__(self, instance: None, owner: type) -> "Field[_ST, _GT]": ...
+    @overload
+    def __get__(self, instance: object, owner: type) -> _GT: ...
+    def __get__(self, instance, owner): ...
+class CharField(Field[str, str]):
+    def __init__(self, *, max_length: int = 255): ...
+class IntegerField(Field[int, int]):
+    def __init__(self, *, default: int = 0): ...
+"#,
+                )
+                .site_packages(
+                    "django/db/models/fields/related.py",
+                    r#"
+from typing import Generic, TypeVar, overload
+_To = TypeVar("_To")
+class ForeignKey(Generic[_To]):
+    @overload
+    def __get__(self, instance: None, owner: type) -> "ForeignKey[_To]": ...
+    @overload
+    def __get__(self, instance: object, owner: type) -> _To: ...
+    def __get__(self, instance, owner): ...
+    def __init__(self, to: type, *, on_delete=None, related_name: str = ""): ...
+"#,
+                )
+                .site_packages(
+                    "django/db/models/manager.py",
+                    r#"
+from typing import Any, Generic, TypeVar
+_T = TypeVar("_T")
+class Manager(Generic[_T]):
+    def filter(self, **kwargs: Any) -> Any: ...
+    def exclude(self, **kwargs: Any) -> Any: ...
+    def get(self, **kwargs: Any) -> Any: ...
+"#,
+                )
+                .source("main.py", code)
+                .completion_test_builder();
+            let test = builder.build();
+            let mut names: Vec<String> = test
+                .completions()
+                .iter()
+                .map(|c| c.name.to_string())
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        };
+        let base = r#"
+from django.db.models import Model, CharField, IntegerField, ForeignKey
+class Author(Model):
+    name = CharField(max_length=100)
+class Book(Model):
+    title = CharField(max_length=100)
+    pages = IntegerField()
+    author = ForeignKey(Author, on_delete=None)
+"#;
+        // Top level: plain field names, transform suffixes, and relations.
+        let top = run(format!("{base}\nBook.objects.filter(<CURSOR>)\n"));
+        assert!(top.contains(&"title".to_string()), "{top:?}");
+        assert!(top.contains(&"title__icontains".to_string()), "{top:?}");
+        assert!(top.contains(&"pages__gte".to_string()), "{top:?}");
+        assert!(top.contains(&"author".to_string()), "{top:?}");
+        assert!(top.contains(&"author__isnull".to_string()), "{top:?}");
+        // A text field doesn't get numeric comparison suffixes.
+        assert!(!top.contains(&"title__gte".to_string()), "{top:?}");
+
+        // `exclude` behaves the same.
+        let excl = run(format!("{base}\nBook.objects.exclude(<CURSOR>)\n"));
+        assert!(excl.contains(&"title__icontains".to_string()), "{excl:?}");
+
+        // Relation traversal after `__`.
+        let nested = run(format!("{base}\nBook.objects.filter(author__<CURSOR>)\n"));
+        assert!(nested.contains(&"author__name".to_string()), "{nested:?}");
+        assert!(
+            nested.contains(&"author__name__icontains".to_string()),
+            "{nested:?}"
+        );
+    }
+
+    /// Inside a string argument of a Django queryset method (`prefetch_related`, `select_related`,
+    /// `values`, ...), the model's field/relation names are offered, including `field__field`
+    /// relation paths that traverse into related models.
+    #[test]
+    fn django_queryset_lookup_string_completions() {
+        // Returns the sorted, de-duplicated completion labels for `code` (which must contain a
+        // single `<CURSOR>` marker inside a string literal).
+        let run = |code: String| -> Vec<String> {
+            let builder = CursorTest::builder()
+                .with_site_packages()
+                .site_packages("django/__init__.py", "")
+                .site_packages("django/db/__init__.py", "")
+                .site_packages(
+                    "django/db/models/__init__.py",
+                    r#"
+from django.db.models.base import Model
+from django.db.models.fields import CharField
+from django.db.models.fields.related import ForeignKey
+from django.db.models.manager import Manager
+"#,
+                )
+                .site_packages("django/db/models/base.py", "class Model: ...")
+                .site_packages(
+                    "django/db/models/fields/__init__.py",
+                    "class CharField:\n    def __init__(self, *, max_length: int = 255): ...",
+                )
+                .site_packages(
+                    "django/db/models/fields/related.py",
+                    r#"
+from typing import Generic, TypeVar, overload
+_To = TypeVar("_To")
+class ForeignKey(Generic[_To]):
+    @overload
+    def __get__(self, instance: None, owner: type) -> "ForeignKey[_To]": ...
+    @overload
+    def __get__(self, instance: object, owner: type) -> _To: ...
+    def __get__(self, instance, owner): ...
+    def __init__(self, to: type, *, on_delete=None, related_name: str = ""): ...
+"#,
+                )
+                .site_packages(
+                    "django/db/models/manager.py",
+                    r#"
+from typing import Any, Generic, TypeVar
+_T = TypeVar("_T")
+class Manager(Generic[_T]):
+    def prefetch_related(self, *args: Any) -> Any: ...
+    def select_related(self, *args: Any) -> Any: ...
+    def values(self, *args: Any) -> Any: ...
+"#,
+                )
+                .source("main.py", code)
+                .completion_test_builder();
+            let test = builder.build();
+            let mut names: Vec<String> = test
+                .completions()
+                .iter()
+                .map(|c| c.name.to_string())
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        };
+
+        let base = r#"
+from django.db.models import Model, CharField, ForeignKey
+
+class Publisher(Model):
+    name = CharField(max_length=100)
+
+class Author(Model):
+    name = CharField(max_length=100)
+    publisher = ForeignKey(Publisher, on_delete=None)
+
+class Book(Model):
+    title = CharField(max_length=100)
+    author = ForeignKey(Author, on_delete=None)
+"#;
+
+        // `prefetch_related`/`select_related` offer relation names at the top level...
+        let top = run(format!(
+            "{base}\nBook.objects.prefetch_related(\"<CURSOR>\")\n"
+        ));
+        assert!(top.contains(&"author".to_string()), "{top:?}");
+        assert!(!top.contains(&"title".to_string()), "{top:?}");
+
+        // ...and traverse relation paths after `__` into the related model.
+        let nested = run(format!(
+            "{base}\nBook.objects.prefetch_related(\"author__<CURSOR>\")\n"
+        ));
+        assert!(
+            nested.contains(&"author__publisher".to_string()),
+            "{nested:?}"
+        );
+
+        // `values`/`only`/`defer`/`order_by` offer field names (and relations).
+        let values = run(format!("{base}\nBook.objects.values(\"<CURSOR>\")\n"));
+        assert!(values.contains(&"title".to_string()), "{values:?}");
+        assert!(values.contains(&"author".to_string()), "{values:?}");
     }
 
     #[test]
