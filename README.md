@@ -29,6 +29,8 @@ This fork was created to improve the Zed experience working with a Django (pytho
 },
 ```
 
+Original readme below:
+
 # Ruff
 
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
