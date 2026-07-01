@@ -5474,29 +5474,44 @@ pub(crate) fn django_synthesized_instance_member_names<'db>(
 /// `ForeignKey`/`OneToOneField`/`ManyToManyField` at it. Mirrors the scopes searched by
 /// [`StaticClassLiteral::django_reverse_instance_member`] so enumerated names stay resolvable.
 fn django_reverse_member_names<'db>(db: &'db dyn Db, class: StaticClassLiteral<'db>) -> Vec<Name> {
+    django_reverse_members_for_target(db, class)
+        .into_iter()
+        .map(|member| member.name)
+        .collect()
+}
+
+/// All reverse-relation members targeting `class`, collected across every scope the reverse-relation
+/// machinery searches (the model's `models` module, the top-level package, the project search path,
+/// and the model's own module). Callers pick either the attribute accessor name (`member.name`, e.g.
+/// `book_set`) or the query-lookup name (`member.query_name`, e.g. `book`) depending on whether they
+/// are completing attribute access or filter lookups.
+fn django_reverse_members_for_target<'db>(
+    db: &'db dyn Db,
+    class: StaticClassLiteral<'db>,
+) -> Vec<DjangoReverseMemberInfo<'db>> {
     if django_model_is_abstract(db, class) {
         return Vec::new();
     }
 
     let file = class.file(db);
-    let mut names = Vec::new();
+    let mut members = Vec::new();
 
     if let Some(models_module) = django_models_module_for_file(db, file) {
         for member in django_reverse_members_in_models_module(db, models_module) {
             if member.target_model == class {
-                names.push(member.name.clone());
+                members.push(member.clone());
             }
         }
     }
     if let Some(top_level_package) = django_top_level_package_for_file(db, file) {
         for member in django_reverse_members_in_top_level_package(db, top_level_package) {
             if member.target_model == class {
-                names.push(member.name.clone());
+                members.push(member.clone());
             }
         }
         for member in django_reverse_members_in_project_search_path(db, top_level_package) {
             if member.target_model == class {
-                names.push(member.name.clone());
+                members.push(member.clone());
             }
         }
     }
@@ -5517,16 +5532,28 @@ fn django_reverse_member_names<'db>(db: &'db dyn Db, class: StaticClassLiteral<'
                 ) {
                     continue;
                 }
+                // Gate on the accessor name so this matches the reverse *attribute* enumeration; the
+                // query name (used for filter lookups) falls back to the accessor name in the rare
+                // case Django would suppress only the query name.
                 if django_relation_targets_model(db, source_model, field, class)
                     && let Some(name) = reverse_related_name(db, source_model, field)
                 {
-                    names.push(name);
+                    let query_name = reverse_related_query_name(db, source_model, field)
+                        .unwrap_or_else(|| name.clone());
+                    members.push(DjangoReverseMemberInfo {
+                        target_model: class,
+                        name,
+                        query_name,
+                        source_model,
+                        source_file: source_model.file(db),
+                        kind: field.kind,
+                    });
                 }
             }
         }
     }
 
-    names
+    members
 }
 
 /// Completion candidates for the string-literal lookup argument of a Django queryset method.
@@ -5635,7 +5662,11 @@ pub(crate) fn django_filter_lookup_completions<'db>(
     let mut current = model_class;
     if !path_str.is_empty() {
         for segment in path_str.split("__") {
-            let Some(next) = django_relation_target_by_name(db, current, segment) else {
+            // A path segment can be a forward field/relation or a reverse relation (matched by its
+            // query name, e.g. `book` for a `Book.author` ForeignKey).
+            let next = django_relation_target_by_name(db, current, segment)
+                .or_else(|| django_reverse_relation_target_by_query_name(db, current, segment));
+            let Some(next) = next else {
                 return Vec::new();
             };
             current = next;
@@ -5655,6 +5686,16 @@ pub(crate) fn django_filter_lookup_completions<'db>(
         candidates.push(format!("{prefix}{name}"));
         for suffix in django_field_lookup_suffixes(field.kind) {
             candidates.push(format!("{prefix}{name}__{suffix}"));
+        }
+    }
+
+    // Reverse relations, offered under their query name (`book`, not the `book_set` accessor). These
+    // behave like forward relations for lookup purposes and can be traversed further with `__`.
+    for member in django_reverse_members_for_target(db, current) {
+        let query_name = member.query_name.as_str();
+        candidates.push(format!("{prefix}{query_name}"));
+        for suffix in django_field_lookup_suffixes(member.kind) {
+            candidates.push(format!("{prefix}{query_name}__{suffix}"));
         }
     }
 
@@ -5768,6 +5809,20 @@ fn django_relation_target_by_name<'db>(
     // target via the field descriptor even when the target model isn't declared in a `models`
     // module (which is all `target_model_for_relation_field` can resolve string references from).
     django_model_class_from_related_type(db, field.instance_type_for_model(db, model_class))
+}
+
+/// Resolve a reverse-relation lookup segment (matched by its query name, e.g. `book`) to the model
+/// on the near side of the relation (the model that declares the pointing field), so reverse
+/// relations can be traversed within filter lookup paths.
+fn django_reverse_relation_target_by_query_name<'db>(
+    db: &'db dyn Db,
+    model_class: StaticClassLiteral<'db>,
+    query_name: &str,
+) -> Option<StaticClassLiteral<'db>> {
+    django_reverse_members_for_target(db, model_class)
+        .into_iter()
+        .find(|member| member.query_name.as_str() == query_name)
+        .map(|member| member.source_model)
 }
 
 pub(super) fn synthesize_django_auth_boolean_instance_member<'db>(
