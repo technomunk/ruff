@@ -10653,9 +10653,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         );
     }
 
-    fn literal_string_collection_items(
-        expr: &ast::Expr,
-    ) -> Option<(&[ast::Expr], bool)> {
+    fn literal_string_collection_items(expr: &ast::Expr) -> Option<(&[ast::Expr], bool)> {
         match expr {
             ast::Expr::List(ast::ExprList { elts, .. })
             | ast::Expr::Tuple(ast::ExprTuple { elts, .. })
@@ -10900,24 +10898,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .unwrap_or(false);
 
         if flat && named {
-            let Some(builder) = self
+            let builder = self
                 .context
-                .report_lint(&INVALID_ARGUMENT_TYPE, call_expression)
-            else {
-                return None;
-            };
+                .report_lint(&INVALID_ARGUMENT_TYPE, call_expression)?;
             builder.into_diagnostic("Django values_list cannot use `flat=True` with `named=True`");
             return None;
         }
 
         let args = &call_expression.arguments.args;
         if flat && args.len() > 1 {
-            let Some(builder) = self
+            let builder = self
                 .context
-                .report_lint(&INVALID_ARGUMENT_TYPE, call_expression)
-            else {
-                return None;
-            };
+                .report_lint(&INVALID_ARGUMENT_TYPE, call_expression)?;
             builder
                 .into_diagnostic("Django values_list with `flat=True` requires exactly one field");
             return None;
@@ -10956,12 +10948,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     .map(|(_, row_ty)| *row_ty)
                     .collect::<Vec<_>>();
                 let [row_ty] = row_types.as_slice() else {
-                    let Some(builder) = self
+                    let builder = self
                         .context
-                        .report_lint(&INVALID_ARGUMENT_TYPE, call_expression)
-                    else {
-                        return None;
-                    };
+                        .report_lint(&INVALID_ARGUMENT_TYPE, call_expression)?;
                     builder.into_diagnostic(
                         "Django values_list with `flat=True` requires exactly one field",
                     );
@@ -10977,12 +10966,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
 
         if flat && named {
-            let Some(builder) = self
+            let builder = self
                 .context
-                .report_lint(&INVALID_ARGUMENT_TYPE, call_expression)
-            else {
-                return None;
-            };
+                .report_lint(&INVALID_ARGUMENT_TYPE, call_expression)?;
             builder.into_diagnostic("Django values_list cannot use `flat=True` with `named=True`");
             return None;
         }
@@ -11030,9 +11016,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 );
             }
             for keyword in &call_expression.arguments.keywords {
-                let Some(keyword_name) = keyword.arg.as_ref() else {
-                    return None;
-                };
+                let keyword_name = keyword.arg.as_ref()?;
                 items.insert(
                     Name::new(keyword_name.as_str()),
                     functional_typed_dict_field(
@@ -11545,9 +11529,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             );
         }
         for keyword in &call_expression.arguments.keywords {
-            let Some(keyword_name) = keyword.arg.as_ref() else {
-                return None;
-            };
+            let keyword_name = keyword.arg.as_ref()?;
             items.insert(
                 Name::new(keyword_name.as_str()),
                 functional_typed_dict_field(
@@ -11773,9 +11755,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
     }
 
-    fn django_prefetch_queryset_expression(
-        call: &ast::ExprCall,
-    ) -> Option<&ast::Expr> {
+    fn django_prefetch_queryset_expression(call: &ast::ExprCall) -> Option<&ast::Expr> {
         call.arguments
             .keywords
             .iter()
@@ -12064,12 +12044,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let (field_arg, model_owner_ty, field_name) =
             self.django_meta_get_field_call_parts(call_expression)?;
 
-        if django_meta_has_field(self.db(), model_owner_ty, field_name.value.to_str())
-            == Some(false)
-        {
-            let Some(builder) = self.context.report_lint(&UNKNOWN_ARGUMENT, field_arg) else {
-                return None;
-            };
+        if !django_meta_has_field(self.db(), model_owner_ty, field_name.value.to_str()) {
+            let builder = self.context.report_lint(&UNKNOWN_ARGUMENT, field_arg)?;
             builder.into_diagnostic(format_args!(
                 "Django model field `{}` does not exist",
                 field_name.value.to_str()

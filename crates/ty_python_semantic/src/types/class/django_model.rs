@@ -21,7 +21,7 @@ use ty_python_core::{SemanticIndex, global_scope, scope::NodeWithScopeRef, seman
 
 /// The category of a Django model field, used to determine the Python type
 /// that accessing the field on a model instance should produce.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Update, get_size2::GetSize)]
 pub(super) enum DjangoFieldKind {
     // character / text
     Char,
@@ -277,6 +277,11 @@ pub(crate) fn is_django_querydict_instance(db: &dyn Db, ty: Type) -> bool {
 
 /// A single Django model field declaration with its resolved Python type information.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::Update, get_size2::GetSize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag mirrors a distinct Django field attribute; collapsing them into enums \
+              would obscure the 1:1 mapping to Django's field options"
+)]
 pub(super) struct DjangoFieldInfo<'db> {
     pub name: Name,
     pub file: File,
@@ -317,6 +322,10 @@ struct DjangoReverseMemberInfo<'db> {
     kind: DjangoFieldKind,
 }
 
+#[expect(
+    clippy::boxed_local,
+    reason = "the signature must match the salsa cycle-recovery function's value type"
+)]
 fn django_reverse_members_cycle_recover<'db>(
     _db: &'db dyn Db,
     _cycle: &salsa::Cycle,
@@ -1247,8 +1256,8 @@ pub(crate) fn django_meta_has_field<'db>(
     db: &'db dyn Db,
     model_owner_ty: Type<'db>,
     field_name: &str,
-) -> Option<bool> {
-    Some(django_meta_field(db, model_owner_ty, field_name).is_some())
+) -> bool {
+    django_meta_field(db, model_owner_ty, field_name).is_some()
 }
 
 fn django_meta_field<'db>(
@@ -1269,10 +1278,10 @@ fn django_meta_field<'db>(
         .iter()
         .find(|field| field.name.as_str() == field_name)
         .cloned()
-        .map(DjangoMetaField::Field)
+        .map(|field| DjangoMetaField::Field(Box::new(field)))
         .or_else(|| {
             (field_name == "id" && !fields.iter().any(|field| field.primary_key)).then(|| {
-                DjangoMetaField::Field(DjangoFieldInfo {
+                DjangoMetaField::Field(Box::new(DjangoFieldInfo {
                     name: Name::new_static("id"),
                     file: model_class.file(db),
                     class_name: "AutoField".to_string(),
@@ -1287,7 +1296,7 @@ fn django_meta_field<'db>(
                     related_name: None,
                     related_query_name: None,
                     to_field: None,
-                })
+                }))
             })
         })
         .or_else(|| {
@@ -1302,7 +1311,7 @@ fn django_meta_field<'db>(
                         )
                 })
                 .cloned()
-                .map(DjangoMetaField::Field)
+                .map(|field| DjangoMetaField::Field(Box::new(field)))
         })
         .or_else(|| {
             django_reverse_member_by_name(db, model_class, field_name)
@@ -1311,7 +1320,7 @@ fn django_meta_field<'db>(
 }
 
 enum DjangoMetaField<'db> {
-    Field(DjangoFieldInfo<'db>),
+    Field(Box<DjangoFieldInfo<'db>>),
     ReverseRelation,
 }
 
@@ -1343,7 +1352,7 @@ fn django_reverse_member_by_name<'db>(
 
     if let Some(models_module) = django_models_module_for_file(db, target_model.file(db))
         && let Some(reverse_member) =
-            django_reverse_members_named_in_models_module(db, models_module, name.clone())
+            django_reverse_members_named_in_models_module(db, models_module, &name)
                 .iter()
                 .find(|reverse_member| reverse_member.target_model == target_model)
                 .cloned()
@@ -1380,7 +1389,7 @@ fn django_reverse_member_by_name<'db>(
                     query_name,
                     source_model,
                     source_file: file,
-                    kind: field.kind.clone(),
+                    kind: field.kind,
                 });
             }
         }
@@ -1451,14 +1460,9 @@ pub(super) fn specialize_declared_django_manager_class_member<'db>(
         (target_name.as_str() == name).then_some(value_expr)
     });
 
-    let Some(value_expr) = value_expr else {
-        return None;
-    };
+    let value_expr = value_expr?;
 
-    let Some(queryset_methods_protocol) = declared_manager_queryset_protocol(db, class, value_expr)
-    else {
-        return None;
-    };
+    let queryset_methods_protocol = declared_manager_queryset_protocol(db, class, value_expr)?;
 
     let manager_ty = specialize_declared_django_manager_member(db, class, ty);
     let manager_ty = manager_ty.unwrap_or_else(|| {
@@ -1843,6 +1847,7 @@ fn queryset_instance_for_manager_model<'db>(
 }
 
 #[salsa::tracked(cycle_initial=|_, _, _, _| None)]
+#[allow(clippy::needless_pass_by_value)]
 fn manager_queryset_class_for_declared_member_in_class<'db>(
     db: &'db dyn Db,
     declaring_class: StaticClassLiteral<'db>,
@@ -1935,8 +1940,7 @@ pub(crate) fn django_queryset_instance_for_reverse_manager<'db>(
             db,
             top_level_package,
             reverse_member_name.clone(),
-        )
-        {
+        ) {
             if reverse_member.target_model == target_model
                 && matches!(
                     reverse_member.kind,
@@ -1953,11 +1957,8 @@ pub(crate) fn django_queryset_instance_for_reverse_manager<'db>(
     }
 
     if let Some(models_module) = django_models_module_for_file(db, target_model.file(db)) {
-        for reverse_member in &django_reverse_members_named_in_models_module(
-            db,
-            models_module,
-            reverse_member_name.clone(),
-        )
+        for reverse_member in
+            &django_reverse_members_named_in_models_module(db, models_module, &reverse_member_name)
         {
             if reverse_member.target_model == target_model
                 && matches!(
@@ -2100,9 +2101,7 @@ fn declared_manager_queryset_protocol<'db>(
     let file = owner_class.file(db);
     let manager_class = manager_assignment_manager_class(db, file, value_expr);
 
-    let Some(queryset_class) = manager_assignment_queryset_class(db, file, value_expr) else {
-        return None;
-    };
+    let queryset_class = manager_assignment_queryset_class(db, file, value_expr)?;
 
     let mut methods: Vec<(String, CallableType<'db>)> = Vec::new();
     add_public_queryset_mro_methods(db, queryset_class, &mut methods);
@@ -2247,12 +2246,7 @@ fn reverse_related_name(
     source_class: StaticClassLiteral,
     field: &DjangoFieldInfo,
 ) -> Option<Name> {
-    reverse_related_name_from_parts(
-        db,
-        source_class,
-        field.kind.clone(),
-        field.related_name.as_ref(),
-    )
+    reverse_related_name_from_parts(db, source_class, field.kind, field.related_name.as_ref())
 }
 
 fn reverse_related_name_from_parts(
@@ -2638,10 +2632,7 @@ fn django_model_modules_imported_by_file(db: &dyn Db, file: File) -> Box<[Module
     cycle_initial=|_, _, _| Box::default(),
     heap_size=ruff_memory_usage::heap_size
 )]
-fn third_party_django_model_modules_imported_by_file(
-    db: &dyn Db,
-    file: File,
-) -> Box<[Module<'_>]> {
+fn third_party_django_model_modules_imported_by_file(db: &dyn Db, file: File) -> Box<[Module<'_>]> {
     collect_django_model_modules_imported_by_file(db, file, true).into_boxed_slice()
 }
 
@@ -2800,6 +2791,7 @@ fn local_class_literal_by_name<'db>(
 }
 
 #[salsa::tracked(cycle_initial=|_, _, _, _| false)]
+#[allow(clippy::needless_pass_by_value)]
 fn module_defines_class_named<'db>(db: &'db dyn Db, module: Module<'db>, name: Name) -> bool {
     let Some(file) = module.file(db) else {
         return false;
@@ -3073,6 +3065,7 @@ fn django_possible_reverse_names_in_top_level_package<'db>(
 }
 
 #[salsa::tracked(cycle_initial=|_, _, _, _| false)]
+#[allow(clippy::needless_pass_by_value)]
 fn django_possible_reverse_name_in_top_level_package<'db>(
     db: &'db dyn Db,
     top_level_module: Module<'db>,
@@ -3112,6 +3105,7 @@ fn django_possible_reverse_names_in_project_search_path<'db>(
 }
 
 #[salsa::tracked(cycle_initial=|_, _, _, _| false)]
+#[allow(clippy::needless_pass_by_value)]
 fn django_possible_reverse_name_in_project_search_path<'db>(
     db: &'db dyn Db,
     anchor_module: Module<'db>,
@@ -3199,7 +3193,7 @@ fn django_reverse_members_in_models_module<'db>(
                     query_name,
                     source_model,
                     source_file,
-                    kind: field.kind.clone(),
+                    kind: field.kind,
                 });
             }
         }
@@ -3211,11 +3205,11 @@ fn django_reverse_members_in_models_module<'db>(
 fn django_reverse_members_named_in_models_module<'db>(
     db: &'db dyn Db,
     models_module: Module<'db>,
-    name: Name,
+    name: &Name,
 ) -> Vec<DjangoReverseMemberInfo<'db>> {
     let mut reverse_members = Vec::new();
     for &module in django_model_modules_in_models_module(db, models_module) {
-        if !possible_reverse_name_in_module(db, module, &name) {
+        if !possible_reverse_name_in_module(db, module, name) {
             continue;
         }
 
@@ -3251,7 +3245,7 @@ fn django_reverse_members_named_in_models_module<'db>(
                     query_name,
                     source_model,
                     source_file,
-                    kind: field.kind.clone(),
+                    kind: field.kind,
                 });
             }
         }
@@ -3266,6 +3260,7 @@ fn django_reverse_members_named_in_models_module<'db>(
     cycle_fn=|db, cycle, previous, current, _, _| django_reverse_members_cycle_recover(db, cycle, previous, current),
     heap_size=ruff_memory_usage::heap_size
 )]
+#[allow(clippy::needless_pass_by_value)]
 fn django_reverse_members_query_named_in_models_module<'db>(
     db: &'db dyn Db,
     models_module: Module<'db>,
@@ -3291,8 +3286,7 @@ fn django_reverse_members_query_named_in_models_module<'db>(
                 ) {
                     continue;
                 }
-                if reverse_related_query_name(db, source_model, field) != Some(query_name.clone())
-                {
+                if reverse_related_query_name(db, source_model, field) != Some(query_name.clone()) {
                     continue;
                 }
 
@@ -3310,7 +3304,7 @@ fn django_reverse_members_query_named_in_models_module<'db>(
                     query_name: query_name.clone(),
                     source_model,
                     source_file,
-                    kind: field.kind.clone(),
+                    kind: field.kind,
                 });
             }
         }
@@ -3344,6 +3338,7 @@ fn django_reverse_members_in_top_level_package<'db>(
     cycle_fn=|db, cycle, previous, current, _, _| django_reverse_members_cycle_recover(db, cycle, previous, current),
     heap_size=ruff_memory_usage::heap_size
 )]
+#[allow(clippy::needless_pass_by_value)]
 fn django_reverse_members_named_in_top_level_package<'db>(
     db: &'db dyn Db,
     top_level_module: Module<'db>,
@@ -3360,7 +3355,7 @@ fn django_reverse_members_named_in_top_level_package<'db>(
         reverse_members.extend(django_reverse_members_named_in_models_module(
             db,
             models_module,
-            name.clone(),
+            &name,
         ));
     }
 
@@ -3373,6 +3368,7 @@ fn django_reverse_members_named_in_top_level_package<'db>(
     cycle_fn=|db, cycle, previous, current, _, _| django_reverse_members_cycle_recover(db, cycle, previous, current),
     heap_size=ruff_memory_usage::heap_size
 )]
+#[allow(clippy::needless_pass_by_value)]
 fn django_reverse_members_query_named_in_top_level_package<'db>(
     db: &'db dyn Db,
     top_level_module: Module<'db>,
@@ -3415,6 +3411,7 @@ fn django_reverse_members_in_project_search_path<'db>(
     cycle_fn=|db, cycle, previous, current, _, _| django_reverse_members_cycle_recover(db, cycle, previous, current),
     heap_size=ruff_memory_usage::heap_size
 )]
+#[allow(clippy::needless_pass_by_value)]
 fn django_reverse_members_named_in_project_search_path<'db>(
     db: &'db dyn Db,
     anchor_module: Module<'db>,
@@ -3431,7 +3428,7 @@ fn django_reverse_members_named_in_project_search_path<'db>(
         reverse_members.extend(django_reverse_members_named_in_models_module(
             db,
             models_module,
-            name.clone(),
+            &name,
         ));
     }
 
@@ -3444,6 +3441,7 @@ fn django_reverse_members_named_in_project_search_path<'db>(
     cycle_fn=|db, cycle, previous, current, _, _| django_reverse_members_cycle_recover(db, cycle, previous, current),
     heap_size=ruff_memory_usage::heap_size
 )]
+#[allow(clippy::needless_pass_by_value)]
 fn django_reverse_members_query_named_in_project_search_path<'db>(
     db: &'db dyn Db,
     anchor_module: Module<'db>,
@@ -3462,6 +3460,7 @@ fn django_reverse_members_query_named_in_project_search_path<'db>(
 }
 
 #[salsa::tracked(cycle_initial=|_, _, _, _| None)]
+#[allow(clippy::needless_pass_by_value)]
 fn django_model_named_in_top_level_package<'db>(
     db: &'db dyn Db,
     top_level_module: Module<'db>,
@@ -3493,6 +3492,7 @@ fn module_path_contains_component(db: &dyn Db, module: Module, component: &str) 
 }
 
 #[salsa::tracked(cycle_initial=|_, _, _, _, _| None)]
+#[allow(clippy::needless_pass_by_value)]
 fn django_model_named_in_project_app_label(
     db: &dyn Db,
     file: File,
@@ -3527,6 +3527,7 @@ fn django_model_named_in_project_app_label(
 }
 
 #[salsa::tracked(cycle_initial=|_, _, _, _| None)]
+#[allow(clippy::needless_pass_by_value)]
 fn django_model_named_in_project(
     db: &dyn Db,
     file: File,
@@ -3848,10 +3849,7 @@ fn django_settings_string_member(db: &dyn Db, file: File, name: &str) -> Option<
 }
 
 #[salsa::tracked(cycle_initial=|_, _, _| None)]
-fn django_auth_user_model_class(
-    db: &dyn Db,
-    file: File,
-) -> Option<StaticClassLiteral<'_>> {
+fn django_auth_user_model_class(db: &dyn Db, file: File) -> Option<StaticClassLiteral<'_>> {
     if let Some(auth_user_model) = django_settings_string_member(db, file, "AUTH_USER_MODEL") {
         let resolved_model = resolve_dotted_model_reference(db, file, &auth_user_model);
         let resolved_class = static_class_from_instance(db, resolved_model);
@@ -4508,8 +4506,7 @@ fn django_reverse_query_source_model<'db>(
             db,
             top_level_package,
             reverse_member_name.clone(),
-        )
-        {
+        ) {
             if reverse_member_matches(reverse_member) {
                 return Some(reverse_member.source_model);
             }
@@ -4519,8 +4516,7 @@ fn django_reverse_query_source_model<'db>(
             db,
             top_level_package,
             reverse_member_name.clone(),
-        )
-        {
+        ) {
             if reverse_member_matches(reverse_member) {
                 return Some(reverse_member.source_model);
             }
@@ -4532,8 +4528,7 @@ fn django_reverse_query_source_model<'db>(
             db,
             models_module,
             reverse_member_name.clone(),
-        )
-        {
+        ) {
             if reverse_member_matches(reverse_member) {
                 return Some(reverse_member.source_model);
             }
@@ -5234,7 +5229,7 @@ impl<'db> StaticClassLiteral<'db> {
 
     /// Return the reverse Django relation named `name` from models in the same
     /// Django `models` module or `models/` package.
-    fn django_reverse_instance_member(self, db: &'db dyn Db, name: Name) -> Option<Type<'db>> {
+    fn django_reverse_instance_member(self, db: &'db dyn Db, name: &Name) -> Option<Type<'db>> {
         if django_model_is_abstract(db, self) {
             return None;
         }
@@ -5242,7 +5237,7 @@ impl<'db> StaticClassLiteral<'db> {
         if let Some(models_module) = django_models_module_for_file(db, self.file(db))
             && django_possible_reverse_names_in_models_module(db, models_module)
                 .iter()
-                .any(|possible_name| possible_name == &name)
+                .any(|possible_name| possible_name == name)
             && django_models_module_may_have_type_checking_cycle(db, models_module)
         {
             return Some(Type::unknown());
@@ -5262,12 +5257,12 @@ impl<'db> StaticClassLiteral<'db> {
         if let Some(models_module) = django_models_module_for_file(db, self.file(db)) {
             if django_possible_reverse_names_in_models_module(db, models_module)
                 .iter()
-                .any(|possible_name| possible_name == &name)
+                .any(|possible_name| possible_name == name)
             {
                 for reverse_member in
-                    &django_reverse_members_named_in_models_module(db, models_module, name.clone())
+                    &django_reverse_members_named_in_models_module(db, models_module, name)
                 {
-                    if reverse_member.target_model != self || reverse_member.name != name {
+                    if reverse_member.target_model != self || reverse_member.name != *name {
                         continue;
                     }
 
@@ -5286,9 +5281,8 @@ impl<'db> StaticClassLiteral<'db> {
                     db,
                     top_level_package,
                     name.clone(),
-                )
-                {
-                    if reverse_member.target_model != self || reverse_member.name != name {
+                ) {
+                    if reverse_member.target_model != self || reverse_member.name != *name {
                         continue;
                     }
 
@@ -5305,7 +5299,7 @@ impl<'db> StaticClassLiteral<'db> {
             django_model_modules_imported_by_file(db, self.file(db))
         };
         for module in imported_modules {
-            if !possible_reverse_name_in_module(db, *module, &name)
+            if !possible_reverse_name_in_module(db, *module, name)
                 && module_name_last_component(db, *module) != Some("models")
             {
                 continue;
@@ -5314,7 +5308,7 @@ impl<'db> StaticClassLiteral<'db> {
             if module_name_last_component(db, *module) == Some("models")
                 && !django_possible_reverse_names_in_models_module(db, *module)
                     .iter()
-                    .any(|possible_name| possible_name == &name)
+                    .any(|possible_name| possible_name == name)
             {
                 continue;
             }
@@ -5323,7 +5317,7 @@ impl<'db> StaticClassLiteral<'db> {
             push_django_model_module(db, *module, &mut modules);
 
             for module in modules {
-                if !possible_reverse_name_in_module(db, module, &name)
+                if !possible_reverse_name_in_module(db, module, name)
                     && module_name_last_component(db, module) != Some("models")
                 {
                     continue;
@@ -5331,7 +5325,7 @@ impl<'db> StaticClassLiteral<'db> {
                 if module_name_last_component(db, module) == Some("models")
                     && !django_possible_reverse_names_in_models_module(db, module)
                         .iter()
-                        .any(|possible_name| possible_name == &name)
+                        .any(|possible_name| possible_name == name)
                 {
                     continue;
                 }
@@ -5373,7 +5367,7 @@ impl<'db> StaticClassLiteral<'db> {
 
         let file = self.file(db);
         if let Some(module) = file_to_module(db, file)
-            && possible_reverse_name_in_module(db, module, &name)
+            && possible_reverse_name_in_module(db, module, name)
         {
             for source_model in django_model_classes_in_module(db, module).iter().copied() {
                 if source_model == self {
@@ -5421,9 +5415,8 @@ impl<'db> StaticClassLiteral<'db> {
                 db,
                 top_level_package,
                 name.clone(),
-            )
-            {
-                if reverse_member.target_model != self || reverse_member.name != name {
+            ) {
+                if reverse_member.target_model != self || reverse_member.name != *name {
                     continue;
                 }
 
@@ -5660,7 +5653,7 @@ pub(crate) fn django_filter_lookup_completions<'db>(
         let name = field.name.as_str();
         // The bare field/relation name (relations can be traversed further with `__`).
         candidates.push(format!("{prefix}{name}"));
-        for suffix in django_field_lookup_suffixes(&field.kind) {
+        for suffix in django_field_lookup_suffixes(field.kind) {
             candidates.push(format!("{prefix}{name}__{suffix}"));
         }
     }
@@ -5673,7 +5666,7 @@ pub(crate) fn django_filter_lookup_completions<'db>(
 /// The Django lookup-transform suffixes (without the leading `__`) that apply to a field of the
 /// given kind. Relation fields only expose the handful that operate on the relation itself; scalar
 /// fields build from a common set plus type-specific text / comparison / date-component transforms.
-fn django_field_lookup_suffixes(kind: &DjangoFieldKind) -> Vec<&'static str> {
+fn django_field_lookup_suffixes(kind: DjangoFieldKind) -> Vec<&'static str> {
     if matches!(
         kind,
         DjangoFieldKind::ForeignKey
@@ -5876,7 +5869,7 @@ fn synthesize_django_instance_member_impl<'db>(
                     .or_else(|| mptt_model_instance_member(db, class, name))
                     .or_else(|| {
                         include_reverse_members
-                            .then(|| class.django_reverse_instance_member(db, Name::new(name)))
+                            .then(|| class.django_reverse_instance_member(db, &Name::new(name)))
                             .flatten()
                     });
             }
@@ -5943,7 +5936,7 @@ fn synthesize_django_instance_member_impl<'db>(
                 })
                 .or_else(|| {
                     include_reverse_members
-                        .then(|| class.django_reverse_instance_member(db, Name::new(name)))
+                        .then(|| class.django_reverse_instance_member(db, &Name::new(name)))
                         .flatten()
                 })
         }
