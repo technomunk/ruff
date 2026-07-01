@@ -2278,8 +2278,7 @@ fn add_django_filter_kwarg_completions<'db>(
 /// Strips a string literal's prefix letters (e.g. `r`, `b`) and opening quote(s), returning the
 /// body text that follows.
 fn strip_string_opener(raw: &str) -> &str {
-    let after_prefix = raw
-        .trim_start_matches(['r', 'R', 'b', 'B', 'u', 'U', 'f', 'F']);
+    let after_prefix = raw.trim_start_matches(['r', 'R', 'b', 'B', 'u', 'U', 'f', 'F']);
     match after_prefix.chars().next() {
         Some(quote @ ('"' | '\'')) => after_prefix.trim_start_matches(quote),
         _ => after_prefix,
@@ -9879,7 +9878,7 @@ class ForeignKey(Generic[_To]):
     @overload
     def __get__(self, instance: object, owner: type) -> _To: ...
     def __get__(self, instance, owner): ...
-    def __init__(self, to: type, *, on_delete=None, related_name: str = ""): ...
+    def __init__(self, to: type, *, on_delete=None, related_name: str = "", related_query_name: str = ""): ...
 "#,
                 )
                 .site_packages(
@@ -9913,6 +9912,9 @@ class Book(Model):
     title = CharField(max_length=100)
     pages = IntegerField()
     author = ForeignKey(Author, on_delete=None)
+class Review(Model):
+    stars = IntegerField()
+    book = ForeignKey(Book, on_delete=None, related_name="reviews", related_query_name="critique")
 "#;
         // Top level: plain field names, transform suffixes, and relations.
         let top = run(format!("{base}\nBook.objects.filter(<CURSOR>)\n"));
@@ -9923,6 +9925,11 @@ class Book(Model):
         assert!(top.contains(&"author__isnull".to_string()), "{top:?}");
         // A text field doesn't get numeric comparison suffixes.
         assert!(!top.contains(&"title__gte".to_string()), "{top:?}");
+        // Reverse relations are offered under their query name (`critique`), with relation suffixes,
+        // and NOT under the attribute accessor name (`reviews`), which is not a valid filter lookup.
+        assert!(top.contains(&"critique".to_string()), "{top:?}");
+        assert!(top.contains(&"critique__isnull".to_string()), "{top:?}");
+        assert!(!top.contains(&"reviews".to_string()), "{top:?}");
 
         // `exclude` behaves the same.
         let excl = run(format!("{base}\nBook.objects.exclude(<CURSOR>)\n"));
@@ -9934,6 +9941,24 @@ class Book(Model):
         assert!(
             nested.contains(&"author__name__icontains".to_string()),
             "{nested:?}"
+        );
+
+        // A reverse relation with a default query name (`book` for `Book.author`), and NOT the
+        // `book_set` accessor.
+        let reverse = run(format!("{base}\nAuthor.objects.filter(<CURSOR>)\n"));
+        assert!(reverse.contains(&"book".to_string()), "{reverse:?}");
+        assert!(reverse.contains(&"book__isnull".to_string()), "{reverse:?}");
+        assert!(!reverse.contains(&"book_set".to_string()), "{reverse:?}");
+
+        // Traversal *through* a reverse relation into the far model's fields.
+        let reverse_nested = run(format!("{base}\nAuthor.objects.filter(book__<CURSOR>)\n"));
+        assert!(
+            reverse_nested.contains(&"book__title".to_string()),
+            "{reverse_nested:?}"
+        );
+        assert!(
+            reverse_nested.contains(&"book__title__icontains".to_string()),
+            "{reverse_nested:?}"
         );
     }
 
