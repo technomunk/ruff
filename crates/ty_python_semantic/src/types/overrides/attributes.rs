@@ -16,7 +16,7 @@ use crate::{
         ClassBase, ClassType, InstanceFallbackShadowsNonDataDescriptor, IntersectionType,
         KnownInstanceType, MemberLookupPolicy, StaticClassLiteral, Type, TypeQualifiers,
         attribute_write::{DescriptorSetterDomain, descriptor_setter_domain},
-        class::CodeGeneratorKind,
+        class::{CodeGeneratorKind, django_model::is_django_model_attribute_override_exempt},
         context::InferContext,
         diagnostic::{
             INVALID_ATTRIBUTE_OVERRIDE, INVALID_MUTABLE_OVERRIDE, INVALID_PROPERTY_TYPE_OVERRIDE,
@@ -524,6 +524,12 @@ pub(super) fn check_override<'db>(
     name: &Name,
     definition: Definition<'db>,
 ) -> OverrideCheck<'db> {
+    if let Some((class_literal, _)) = class.static_class_literal(db)
+        && is_django_model_attribute_override_exempt(db, env, class_literal, name)
+    {
+        return OverrideCheck::Attribute(None);
+    }
+
     // Classify methods before constructing attribute contracts: some members, such as
     // `object.__hash__`, have method signatures but no general attribute contract.
     // Receiver annotations still describe instance storage even if a method with
@@ -833,6 +839,9 @@ pub(super) fn check_inherited_conflict<'db>(
 ) {
     let db = context.db();
     let env = &context.program_environment();
+    if is_django_model_attribute_override_exempt(db, env, class, name) {
+        return;
+    }
     let receiver = Type::instance(db, env, class_type);
     let kind = AttributeContractKind::Inherited;
     let Some(MemberContract::Attribute(source)) =

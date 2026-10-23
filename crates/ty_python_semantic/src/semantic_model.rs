@@ -936,6 +936,7 @@ impl<'db> SemanticModel<'db> {
     ) -> Vec<String> {
         crate::types::django_lookup_string_completions(
             self.db,
+            &self.program_environment(),
             receiver_ty,
             method_name,
             typed_prefix,
@@ -954,7 +955,12 @@ impl<'db> SemanticModel<'db> {
         receiver_ty: Type<'db>,
         typed_prefix: &str,
     ) -> Vec<String> {
-        crate::types::django_filter_lookup_completions(self.db, receiver_ty, typed_prefix)
+        crate::types::django_filter_lookup_completions(
+            self.db,
+            &self.program_environment(),
+            receiver_ty,
+            typed_prefix,
+        )
     }
 
     fn string_literal_completion_expected_type(

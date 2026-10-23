@@ -75,7 +75,7 @@ class Article(Model):
 a = Article()
 reveal_type(a.title)  # revealed: str
 reveal_type(a.view_count)  # revealed: int
-reveal_type(a.rating)  # revealed: float
+reveal_type(a.rating)  # revealed: float*
 reveal_type(a.published)  # revealed: bool
 
 # TODO(ty#1018): class-level access currently returns the synthesized instance

@@ -747,7 +747,11 @@ class Manager(Generic[_T]):
 ```
 
 ```py
+from typing import TypeVar
+
 from django.db.models import Model, CharField, Manager, QuerySet
+
+_T = TypeVar("_T")
 
 class CacheQuerySet(QuerySet[_T]):
     def nocache(self) -> "CacheQuerySet[_T]":

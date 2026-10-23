@@ -185,7 +185,7 @@ impl TypedDictExtraItems<'_> {
     }
 }
 
-pub(super) fn functional_typed_dict_field(
+pub(crate) fn functional_typed_dict_field(
     declared_ty: Type<'_>,
     qualifiers: TypeQualifiers,
     total: bool,

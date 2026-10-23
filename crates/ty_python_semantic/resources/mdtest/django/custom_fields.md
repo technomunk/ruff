@@ -545,7 +545,7 @@ Task.objects.create(status=Status.OPEN)
 Task.objects.create(status=object())  # error: [invalid-argument-type]
 
 def filter_status(status: str | None) -> None:
-    if status:
+    if status is not None:
         Task.objects.filter(status=status)
 ```
 

@@ -7,7 +7,7 @@ use compact_str::CompactString;
 use itertools::Itertools;
 use ruff_db::diagnostic::{Annotation, Span, SubDiagnostic, SubDiagnosticSeverity};
 use ruff_db::files::File;
-use ruff_db::parsed::ParsedModuleRef;
+use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_db::source::source_text;
 use ruff_diagnostics::{Edit, Fix};
 use ruff_python_ast::helpers::is_dotted_name;
@@ -22,7 +22,7 @@ use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use strum::IntoEnumIterator;
-use ty_module_resolver::{ImportingFile, ModuleName, resolve_module};
+use ty_module_resolver::{ImportingFile, KnownModule, ModuleName, file_to_module, resolve_module};
 use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::statement::StatementInner;
 
@@ -74,7 +74,8 @@ use crate::types::class::django_model::{
     resolve_auth_user_model_reference, resolve_stdlib_instance, static_class_from_instance,
 };
 use crate::types::class::{
-    ClassLiteral, CodeGeneratorKind, FrozenDataclassDispatch, MethodDecorator,
+    ClassLiteral, CodeGeneratorKind, DynamicNamedTupleAnchor, DynamicNamedTupleLiteral,
+    FrozenDataclassDispatch, MethodDecorator, NamedTupleField, NamedTupleSpec, StaticClassLiteral,
 };
 use crate::types::constraints::{CandidateSolutions, ConstraintSetBuilder, Solutions};
 use crate::types::context::InferContext;
@@ -87,9 +88,9 @@ use crate::types::diagnostic::{
     INVALID_PARAMSPEC, INVALID_TYPE_ALIAS_TYPE, INVALID_TYPE_FORM, INVALID_TYPE_VARIABLE_BOUND,
     INVALID_TYPE_VARIABLE_CONSTRAINTS, INVALID_TYPE_VARIABLE_DEFAULT, MISMATCHED_SENTINEL_NAME,
     POSSIBLY_MISSING_IMPLICIT_CALL, POSSIBLY_MISSING_SUBMODULE, TypeCheckDiagnostics,
-    UNRESOLVED_ATTRIBUTE, UNRESOLVED_GLOBAL, UNRESOLVED_REFERENCE, UNSOUND_ASSIGNMENT,
-    UNSOUND_YIELD, UNSUPPORTED_OPERATOR, YieldKind, autofix_with_notimplementederror,
-    hint_if_stdlib_attribute_exists_on_other_versions,
+    UNKNOWN_ARGUMENT, UNRESOLVED_ATTRIBUTE, UNRESOLVED_GLOBAL, UNRESOLVED_REFERENCE,
+    UNSOUND_ASSIGNMENT, UNSOUND_YIELD, UNSUPPORTED_OPERATOR, YieldKind,
+    autofix_with_notimplementederror, hint_if_stdlib_attribute_exists_on_other_versions,
     report_attempted_instantiation_of_abstract_class, report_attempted_protocol_instantiation,
     report_bad_dunder_delattr_call, report_bad_dunder_delete_call, report_call_to_abstract_method,
     report_cannot_pop_required_field_on_typed_dict, report_dynamic_function_decorator_return,
@@ -134,7 +135,10 @@ use crate::types::subclass_of::SubclassOfInner;
 use crate::types::tuple::promotion::TupleSizePromotionConstraints;
 use crate::types::tuple::{Tuple, TupleLength, TupleSpecBuilder, TupleType, VariableSegment};
 use crate::types::type_alias::{ManualPEP695TypeAliasType, PEP695TypeAliasType};
-use crate::types::typed_dict::{TypedDictAssignmentKind, TypedDictKeyAssignment};
+use crate::types::typed_dict::{
+    TypedDictAssignmentKind, TypedDictKeyAssignment, TypedDictSchema, TypedDictType,
+    functional_typed_dict_field,
+};
 use crate::types::typevar::{
     BoundTypeVarIdentity, TypeVarConstraints, TypeVarIdentity, TypeVarInstance, TypeVarSet,
 };
@@ -9392,7 +9396,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             _ => None,
         };
         let method_name = bound_method
-            .map(|bound_method| bound_method.function(self.db()).name(self.db()).as_str())
+            .and_then(|bound_method| bound_method.function(self.db()))
+            .map(|function| function.name(self.db()).as_str())
             .or_else(|| attribute_method.map(|(method_name, _)| method_name));
 
         let Some(method_name) = method_name else {
@@ -9438,13 +9443,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         } else {
             return;
         };
-        let Some(model_instance) = model_instance_from_django_queryset_like(self.db(), receiver_ty)
-        else {
+        let Some(model_instance) = model_instance_from_django_queryset_like(
+            self.db(),
+            self.program_environment(),
+            receiver_ty,
+        ) else {
             return;
         };
         let current_method_instance = self
             .class_context_of_current_method()
-            .map(|class| Type::instance(self.db(), class));
+            .map(|class| Type::instance(self.db(), self.program_environment(), class));
 
         if matches!(
             method_name,
@@ -9483,7 +9491,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }) {
                     continue;
                 }
-                match django_select_related_lookup(self.db(), model_instance, lookup_name) {
+                match django_select_related_lookup(
+                    self.db(),
+                    self.program_environment(),
+                    model_instance,
+                    lookup_name,
+                ) {
                     DjangoRelationLookup::Valid | DjangoRelationLookup::Dynamic => {}
                     DjangoRelationLookup::UnknownField => {
                         let Some(builder) = self.context.report_lint(&UNKNOWN_ARGUMENT, arg) else {
@@ -9545,9 +9558,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     continue;
                 }
                 let lookup_result = if is_generic_prefetch {
-                    django_generic_prefetch_related_lookup(self.db(), model_instance, lookup_name)
+                    django_generic_prefetch_related_lookup(
+                        self.db(),
+                        self.program_environment(),
+                        model_instance,
+                        lookup_name,
+                    )
                 } else {
-                    django_prefetch_related_lookup(self.db(), model_instance, lookup_name)
+                    django_prefetch_related_lookup(
+                        self.db(),
+                        self.program_environment(),
+                        model_instance,
+                        lookup_name,
+                    )
                 };
                 match lookup_result {
                     DjangoRelationLookup::Valid | DjangoRelationLookup::Dynamic => {}
@@ -9694,11 +9717,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     DjangoLookupExpectedType::Expected(expected_type) => {
                         if Self::django_lookup_accepts_value(
                             self.db(),
+                            self.program_environment(),
                             actual_type,
                             expected_type,
                             current_method_instance,
                         ) || Self::is_django_default_callable(self.db(), actual_type)
-                            || Self::is_django_expression_like(self.db(), actual_type)
+                            || Self::is_django_expression_like(
+                                self.db(),
+                                self.program_environment(),
+                                actual_type,
+                            )
                             || Self::is_enum_literal(actual_type)
                         {
                             continue;
@@ -9713,25 +9741,32 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             .into_diagnostic(format_args!(
                                 "Incompatible type for Django default `{field_name}`"
                             ))
-                            .set_primary_message(format_args!(
+                            .set_primary_annotation_message(format_args!(
                                 "Expected `{}`, found `{}`",
-                                expected_type.display(self.db()),
-                                actual_type.display(self.db())
+                                expected_type.display(self.db(), self.program_environment()),
+                                actual_type.display(self.db(), self.program_environment())
                             ));
                     }
                     DjangoLookupExpectedType::UnknownField => {
-                        if let Some(model_class) =
-                            static_class_from_instance(self.db(), model_instance)
-                            && let Some(expected_type) =
-                                self.django_model_writable_property_type(model_class, field_name)
+                        if let Some(model_class) = static_class_from_instance(
+                            self.db(),
+                            self.program_environment(),
+                            model_instance,
+                        ) && let Some(expected_type) =
+                            self.django_model_writable_property_type(model_class, field_name)
                         {
                             if Self::django_lookup_accepts_value(
                                 self.db(),
+                                self.program_environment(),
                                 actual_type,
                                 expected_type,
                                 current_method_instance,
                             ) || Self::is_django_default_callable(self.db(), actual_type)
-                                || Self::is_django_expression_like(self.db(), actual_type)
+                                || Self::is_django_expression_like(
+                                    self.db(),
+                                    self.program_environment(),
+                                    actual_type,
+                                )
                                 || Self::is_enum_literal(actual_type)
                             {
                                 continue;
@@ -9747,10 +9782,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                 .into_diagnostic(format_args!(
                                     "Incompatible type for Django default `{field_name}`"
                                 ))
-                                .set_primary_message(format_args!(
+                                .set_primary_annotation_message(format_args!(
                                     "Expected `{}`, found `{}`",
-                                    expected_type.display(self.db()),
-                                    actual_type.display(self.db())
+                                    expected_type.display(self.db(), self.program_environment()),
+                                    actual_type.display(self.db(), self.program_environment())
                                 ));
                             continue;
                         }
@@ -9783,11 +9818,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 DjangoLookupExpectedType::Expected(expected_type) => {
                     if Self::django_lookup_accepts_value(
                         self.db(),
+                        self.program_environment(),
                         actual_type,
                         expected_type,
                         current_method_instance,
-                    ) || Self::is_django_expression_like(self.db(), actual_type)
-                        || Self::is_enum_literal(actual_type)
+                    ) || Self::is_django_expression_like(
+                        self.db(),
+                        self.program_environment(),
+                        actual_type,
+                    ) || Self::is_enum_literal(actual_type)
                     {
                         continue;
                     }
@@ -9801,10 +9840,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         .into_diagnostic(format_args!(
                             "Incompatible type for Django lookup `{lookup_name}`"
                         ))
-                        .set_primary_message(format_args!(
+                        .set_primary_annotation_message(format_args!(
                             "Expected `{}`, found `{}`",
-                            expected_type.display(self.db()),
-                            actual_type.display(self.db())
+                            expected_type.display(self.db(), self.program_environment()),
+                            actual_type.display(self.db(), self.program_environment())
                         ));
                 }
                 DjangoLookupExpectedType::UnknownField => {
@@ -9911,10 +9950,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let db = self.db();
                 let file_scope_id = self.scope().file_scope_id(db);
                 let use_def = self.index.use_def_map(file_scope_id);
-                let use_id = name.scoped_use_id(db, self.file());
+                let use_id = name.scoped_use_id(db, self.program_file());
 
                 let Some(definition) = place_from_bindings_with_reachability_cache(
                     db,
+                    self.program_environment(),
                     use_def.bindings_at_use(use_id),
                     self.reachability_cache(),
                 )
@@ -9986,7 +10026,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         model_instance: Type<'db>,
         lookup_name: &str,
     ) -> DjangoLookupExpectedType<'db> {
-        let expected = django_lookup_expected_type(self.db(), model_instance, lookup_name);
+        let expected = django_lookup_expected_type(
+            self.db(),
+            self.program_environment(),
+            model_instance,
+            lookup_name,
+        );
         if matches!(
             expected,
             DjangoLookupExpectedType::UnknownField | DjangoLookupExpectedType::Dynamic
@@ -10043,10 +10088,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         member_name: &str,
     ) -> Option<Type<'db>> {
         let property = Type::from(model_class)
-            .member(self.db(), member_name)
+            .member(self.db(), self.program_environment(), member_name)
             .ignore_possibly_undefined()?
             .as_property_instance()?;
-        let setter = property.setter(self.db())?.promote(self.db());
+        let setter = property
+            .setter(self.db())?
+            .promote(self.db(), self.program_environment());
         let callable = setter.as_callable()?;
         let setter_value_types = callable.signatures(self.db()).iter().map(|signature| {
             signature
@@ -10056,7 +10103,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .unwrap_or_else(Type::unknown)
         });
 
-        Some(UnionType::from_elements(self.db(), setter_value_types))
+        Some(UnionType::from_elements(
+            self.db(),
+            self.program_environment(),
+            setter_value_types,
+        ))
     }
 
     fn django_annotation_protocol_member_type(
@@ -10064,7 +10115,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         model_instance: Type<'db>,
         member_name: &str,
     ) -> Option<Type<'db>> {
-        fn property_value_type<'db>(db: &'db dyn Db, ty: Type<'db>) -> Type<'db> {
+        fn property_value_type<'db>(
+            db: &'db dyn Db,
+            env: &ProgramEnvironment<'db>,
+            ty: Type<'db>,
+        ) -> Type<'db> {
             let Type::PropertyInstance(property) = ty else {
                 return ty;
             };
@@ -10073,7 +10128,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             };
             getter
                 .as_callable()
-                .map(|callable| callable.signatures(db).overload_return_type_or_unknown(db))
+                .map(|callable| {
+                    callable
+                        .signatures(db)
+                        .overload_return_type_or_unknown(db, env)
+                })
                 .unwrap_or(ty)
         }
 
@@ -10085,9 +10144,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 return None;
             };
             protocol
-                .instance_member(self.db(), member_name)
+                .instance_member(self.db(), self.program_environment(), member_name)
                 .ignore_possibly_undefined()
-                .map(|ty| property_value_type(self.db(), ty))
+                .map(|ty| property_value_type(self.db(), self.program_environment(), ty))
         })
     }
 
@@ -10115,6 +10174,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             {
                 return Some(django_lookup_suffix_type(
                     self.db(),
+                    self.program_environment(),
                     lookup_suffix,
                     annotation_type,
                 ));
@@ -10137,7 +10197,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 return false;
             };
             protocol
-                .instance_member(self.db(), member_name)
+                .instance_member(self.db(), self.program_environment(), member_name)
                 .ignore_possibly_undefined()
                 .is_some()
         })
@@ -10153,7 +10213,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 Some(typed_dict.items(self.db()).contains_key(item_name))
             }
             _ => {
-                let class = row_ty.nominal_class(self.db())?;
+                let class = row_ty.nominal_class(self.db(), self.program_environment())?;
                 let ClassLiteral::DynamicNamedTuple(named_tuple) = class.class_literal(self.db())
                 else {
                     return None;
@@ -10173,7 +10233,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         item_name: &str,
     ) -> Option<bool> {
         let row_ty = queryset_ty
-            .class_specialization(self.db())?
+            .class_specialization(self.db(), self.program_environment())?
             .1
             .types(self.db())
             .get(1)
@@ -10210,17 +10270,21 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         (!selected_fields.is_empty()).then_some(selected_fields)
     }
 
-    fn is_django_expression_like(db: &dyn Db, ty: Type) -> bool {
+    fn is_django_expression_like(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        ty: Type<'db>,
+    ) -> bool {
         match ty {
             Type::Union(union) => union
                 .elements(db)
                 .iter()
-                .any(|element| Self::is_django_expression_like(db, *element)),
+                .any(|element| Self::is_django_expression_like(db, env, *element)),
             Type::Intersection(intersection) => intersection
                 .positive(db)
                 .iter()
-                .any(|element| Self::is_django_expression_like(db, *element)),
-            _ => ty.nominal_class(db).is_some_and(|class| {
+                .any(|element| Self::is_django_expression_like(db, env, *element)),
+            _ => ty.nominal_class(db, env).is_some_and(|class| {
                 class
                     .iter_mro(db)
                     .filter_map(super::super::class_base::ClassBase::into_class)
@@ -10242,11 +10306,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         )
     }
 
-    fn nominal_class_matches(db: &'db dyn Db, actual: Type<'db>, expected: Type<'db>) -> bool {
-        let Some(actual_class) = actual.nominal_class(db) else {
+    fn nominal_class_matches(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        actual: Type<'db>,
+        expected: Type<'db>,
+    ) -> bool {
+        let Some(actual_class) = actual.nominal_class(db, env) else {
             return false;
         };
-        let Some(expected_class) = expected.nominal_class(db) else {
+        let Some(expected_class) = expected.nominal_class(db, env) else {
             return false;
         };
         let Some((expected_lit, _)) = expected_class.static_class_literal(db) else {
@@ -10280,10 +10349,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn type_has_nominal_class_name_in_mro(
         db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
         ty: Type<'db>,
         class_names: &[&str],
     ) -> bool {
-        ty.nominal_class(db).is_some_and(|class| {
+        ty.nominal_class(db, env).is_some_and(|class| {
             class
                 .iter_mro(db)
                 .filter_map(super::super::class_base::ClassBase::into_class)
@@ -10294,6 +10364,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn django_file_field_accepts_value(
         db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
         actual: Type<'db>,
         expected: Type<'db>,
     ) -> bool {
@@ -10301,24 +10372,28 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return union
                 .elements(db)
                 .iter()
-                .all(|element| Self::django_file_field_accepts_value(db, *element, expected));
+                .all(|element| Self::django_file_field_accepts_value(db, env, *element, expected));
         }
 
         if let Type::Union(union) = expected {
             return union
                 .elements(db)
                 .iter()
-                .any(|element| Self::django_file_field_accepts_value(db, actual, *element));
+                .any(|element| Self::django_file_field_accepts_value(db, env, actual, *element));
         }
 
-        Self::type_has_nominal_class_name_in_mro(db, expected, &["FieldFile", "ImageFieldFile"])
-            && Self::type_has_nominal_class_name_in_mro(db, actual, &["File", "ContentFile"])
+        Self::type_has_nominal_class_name_in_mro(
+            db,
+            env,
+            expected,
+            &["FieldFile", "ImageFieldFile"],
+        ) && Self::type_has_nominal_class_name_in_mro(db, env, actual, &["File", "ContentFile"])
     }
 
-    fn is_enum_instance(db: &'db dyn Db, ty: Type<'db>) -> bool {
-        ty.nominal_class(db)
+    fn is_enum_instance(db: &'db dyn Db, env: &ProgramEnvironment<'db>, ty: Type<'db>) -> bool {
+        ty.nominal_class(db, env)
             .and_then(|class| class.static_class_literal(db).map(|(class, _)| class))
-            .is_some_and(|class| is_enum_class_by_inheritance(db, class))
+            .is_some_and(|class| is_enum_class_by_inheritance(db, env, class))
     }
 
     fn is_str_or_int_instance(db: &'db dyn Db, ty: Type<'db>) -> bool {
@@ -10341,6 +10416,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn django_choices_enum_accepts_value(
         db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
         actual: Type<'db>,
         expected: Type<'db>,
     ) -> bool {
@@ -10348,38 +10424,45 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return union
                 .elements(db)
                 .iter()
-                .any(|element| Self::django_choices_enum_accepts_value(db, actual, *element));
+                .any(|element| Self::django_choices_enum_accepts_value(db, env, actual, *element));
         }
 
         if let Type::Union(union) = actual {
-            return union
-                .elements(db)
-                .iter()
-                .all(|element| Self::django_choices_enum_accepts_value(db, *element, expected));
+            return union.elements(db).iter().all(|element| {
+                Self::django_choices_enum_accepts_value(db, env, *element, expected)
+            });
         }
 
-        (Self::is_enum_instance(db, expected) && Self::is_str_or_int_instance(db, actual))
-            || (Self::is_enum_instance(db, actual) && Self::is_str_or_int_instance(db, expected))
+        (Self::is_enum_instance(db, env, expected) && Self::is_str_or_int_instance(db, actual))
+            || (Self::is_enum_instance(db, env, actual)
+                && Self::is_str_or_int_instance(db, expected))
     }
 
     fn django_lookup_accepts_value(
         db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
         actual: Type<'db>,
         expected: Type<'db>,
         current_method_instance: Option<Type<'db>>,
     ) -> bool {
-        if actual.is_assignable_to(db, expected)
-            || Self::nominal_class_matches(db, actual, expected)
+        if actual.is_assignable_to(db, env, expected)
+            || Self::nominal_class_matches(db, env, actual, expected)
             || Self::django_numeric_lookup_accepts_value(db, actual, expected)
-            || Self::django_file_field_accepts_value(db, actual, expected)
-            || Self::django_choices_enum_accepts_value(db, actual, expected)
+            || Self::django_file_field_accepts_value(db, env, actual, expected)
+            || Self::django_choices_enum_accepts_value(db, env, actual, expected)
         {
             return true;
         }
 
         if let Type::Union(union) = actual {
             return union.elements(db).iter().all(|element| {
-                Self::django_lookup_accepts_value(db, *element, expected, current_method_instance)
+                Self::django_lookup_accepts_value(
+                    db,
+                    env,
+                    *element,
+                    expected,
+                    current_method_instance,
+                )
             });
         }
 
@@ -10387,24 +10470,32 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let typevar_instance = typevar.typevar(db);
             if typevar_instance.is_self(db)
                 && let Some(current_method_instance) = current_method_instance
-                && Self::django_lookup_accepts_value(db, current_method_instance, expected, None)
+                && Self::django_lookup_accepts_value(
+                    db,
+                    env,
+                    current_method_instance,
+                    expected,
+                    None,
+                )
             {
                 return true;
             }
-            match typevar_instance.upper_bound(db) {
+            match typevar_instance.upper_bound(db, env) {
                 Some(bound) => {
                     return Self::django_lookup_accepts_value(
                         db,
+                        env,
                         bound,
                         expected,
                         current_method_instance,
                     );
                 }
                 None => {
-                    if let Some(constraints) = typevar_instance.constraints(db) {
+                    if let Some(constraints) = typevar_instance.constraints(db, env) {
                         return constraints.iter().any(|constraint| {
                             Self::django_lookup_accepts_value(
                                 db,
+                                env,
                                 *constraint,
                                 expected,
                                 current_method_instance,
@@ -10417,7 +10508,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         match expected {
             Type::Union(union) => union.elements(db).iter().any(|element| {
-                Self::django_lookup_accepts_value(db, actual, *element, current_method_instance)
+                Self::django_lookup_accepts_value(
+                    db,
+                    env,
+                    actual,
+                    *element,
+                    current_method_instance,
+                )
             }),
             _ => false,
         }
@@ -10425,11 +10522,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn django_model_init_accepts_value(
         db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
         actual: Type<'db>,
         expected: Type<'db>,
         current_method_instance: Option<Type<'db>>,
     ) -> bool {
-        if Self::django_lookup_accepts_value(db, actual, expected, current_method_instance) {
+        if Self::django_lookup_accepts_value(db, env, actual, expected, current_method_instance) {
             return true;
         }
 
@@ -10445,12 +10543,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 continue;
             }
             saw_non_none = true;
-            if !Self::django_lookup_accepts_value(db, *element, expected, current_method_instance) {
+            if !Self::django_lookup_accepts_value(
+                db,
+                env,
+                *element,
+                expected,
+                current_method_instance,
+            ) {
                 return false;
             }
         }
 
-        saw_none && (saw_non_none || expected.is_assignable_to(db, Type::object()))
+        saw_none && (saw_non_none || expected.is_assignable_to(db, env, Type::object()))
     }
 
     fn check_django_create_field_kwargs(
@@ -10483,6 +10587,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     let accepts_value = if allow_none {
                         Self::django_model_init_accepts_value(
                             self.db(),
+                            self.program_environment(),
                             actual_type,
                             expected_type,
                             current_method_instance,
@@ -10490,13 +10595,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     } else {
                         Self::django_lookup_accepts_value(
                             self.db(),
+                            self.program_environment(),
                             actual_type,
                             expected_type,
                             current_method_instance,
                         )
                     };
                     if accepts_value
-                        || Self::is_django_expression_like(self.db(), actual_type)
+                        || Self::is_django_expression_like(
+                            self.db(),
+                            self.program_environment(),
+                            actual_type,
+                        )
                         || Self::is_enum_literal(actual_type)
                     {
                         continue;
@@ -10511,20 +10621,24 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         .into_diagnostic(format_args!(
                             "Incompatible type for Django {method_name} argument `{field_name}`"
                         ))
-                        .set_primary_message(format_args!(
+                        .set_primary_annotation_message(format_args!(
                             "Expected `{}`, found `{}`",
-                            expected_type.display(self.db()),
-                            actual_type.display(self.db())
+                            expected_type.display(self.db(), self.program_environment()),
+                            actual_type.display(self.db(), self.program_environment())
                         ));
                 }
                 DjangoLookupExpectedType::UnknownField => {
-                    if let Some(model_class) = static_class_from_instance(self.db(), model_instance)
-                        && let Some(expected_type) =
-                            self.django_model_writable_property_type(model_class, field_name)
+                    if let Some(model_class) = static_class_from_instance(
+                        self.db(),
+                        self.program_environment(),
+                        model_instance,
+                    ) && let Some(expected_type) =
+                        self.django_model_writable_property_type(model_class, field_name)
                     {
                         let accepts_value = if allow_none {
                             Self::django_model_init_accepts_value(
                                 self.db(),
+                                self.program_environment(),
                                 actual_type,
                                 expected_type,
                                 current_method_instance,
@@ -10532,6 +10646,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         } else {
                             Self::django_lookup_accepts_value(
                                 self.db(),
+                                self.program_environment(),
                                 actual_type,
                                 expected_type,
                                 current_method_instance,
@@ -10551,10 +10666,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             .into_diagnostic(format_args!(
                                 "Incompatible type for Django {method_name} argument `{field_name}`"
                             ))
-                            .set_primary_message(format_args!(
+                            .set_primary_annotation_message(format_args!(
                                 "Expected `{}`, found `{}`",
-                                expected_type.display(self.db()),
-                                actual_type.display(self.db())
+                                expected_type.display(self.db(), self.program_environment()),
+                                actual_type.display(self.db(), self.program_environment())
                             ));
                         continue;
                     }
@@ -10590,12 +10705,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let model_instance = Type::instance(
             self.db(),
+            self.program_environment(),
             model_class.apply_optional_specialization(self.db(), None),
         );
 
-        if let Some(field_names) =
-            django_model_init_positional_field_names(self.db(), model_instance)
-        {
+        if let Some(field_names) = django_model_init_positional_field_names(
+            self.db(),
+            self.program_environment(),
+            model_instance,
+        ) {
             for (index, arg) in call_expression.arguments.args.iter().enumerate() {
                 if matches!(arg, ast::Expr::Starred(_)) {
                     continue;
@@ -10617,11 +10735,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     DjangoLookupExpectedType::Expected(expected_type) => {
                         if Self::django_lookup_accepts_value(
                             self.db(),
+                            self.program_environment(),
                             actual_type,
                             expected_type,
                             current_method_instance,
-                        ) || Self::is_django_expression_like(self.db(), actual_type)
-                            || Self::is_enum_literal(actual_type)
+                        ) || Self::is_django_expression_like(
+                            self.db(),
+                            self.program_environment(),
+                            actual_type,
+                        ) || Self::is_enum_literal(actual_type)
                         {
                             continue;
                         }
@@ -10633,10 +10755,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             .into_diagnostic(format_args!(
                                 "Incompatible type for Django model field `{field_name}`"
                             ))
-                            .set_primary_message(format_args!(
+                            .set_primary_annotation_message(format_args!(
                                 "Expected `{}`, found `{}`",
-                                expected_type.display(self.db()),
-                                actual_type.display(self.db())
+                                expected_type.display(self.db(), self.program_environment()),
+                                actual_type.display(self.db(), self.program_environment())
                             ));
                     }
                     DjangoLookupExpectedType::UnknownField | DjangoLookupExpectedType::Dynamic => {}
@@ -10670,7 +10792,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         field_expr: &ast::Expr,
         allow_primary_key: bool,
     ) {
-        match django_bulk_field_lookup(self.db(), model_instance, field_name, allow_primary_key) {
+        match django_bulk_field_lookup(
+            self.db(),
+            self.program_environment(),
+            model_instance,
+            field_name,
+            allow_primary_key,
+        ) {
             DjangoBulkFieldLookup::Valid => {}
             DjangoBulkFieldLookup::UnknownField => {
                 let Some(builder) = self.context.report_lint(&UNKNOWN_ARGUMENT, field_expr) else {
@@ -10838,29 +10966,21 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let spec = NamedTupleSpec::known(self.db(), fields);
-        let call_node_index = call_expression.node_index.load();
-        let scope = self.scope();
-        let scope_anchor = scope
-            .node(self.db())
-            .node_index()
-            .unwrap_or(ast::NodeIndex::from(0));
-        let anchor_u32 = scope_anchor
-            .as_u32()
-            .expect("scope anchor should not be NodeIndex::NONE");
-        let call_u32 = call_node_index
-            .as_u32()
-            .expect("call node should not be NodeIndex::NONE");
         let namedtuple = DynamicNamedTupleLiteral::new(
             self.db(),
             Name::new_static("Row"),
             DynamicNamedTupleAnchor::ScopeOffset {
-                scope,
-                offset: call_u32 - anchor_u32,
+                scope: self.scope(),
+                offset: self.dynamic_class_scope_offset(call_expression),
                 spec,
             },
         );
 
-        namedtuple.to_instance(self.db())
+        Type::instance(
+            self.db(),
+            self.program_environment(),
+            ClassType::NonGeneric(namedtuple.into()),
+        )
     }
 
     fn django_queryset_row_type_for_values_list_call(
@@ -10872,7 +10992,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let Type::BoundMethod(bound_method) = callable_type else {
             return None;
         };
-        if bound_method.function(self.db()).name(self.db()).as_str() != "values_list" {
+        if bound_method
+            .function(self.db())
+            .is_none_or(|function| function.name(self.db()).as_str() != "values_list")
+        {
             return None;
         }
 
@@ -10917,15 +11040,25 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let model_instance = model_instance_from_django_queryset_like(
             self.db(),
+            self.program_environment(),
             bound_method.self_instance(self.db()),
         )?;
 
         let row_ty = if args.is_empty() {
             if named {
-                let columns = django_values_list_all_fields_columns(self.db(), model_instance)?;
+                let columns = django_values_list_all_fields_columns(
+                    self.db(),
+                    self.program_environment(),
+                    model_instance,
+                )?;
                 self.django_named_values_list_row_type(call_expression, columns)
             } else {
-                django_values_list_all_fields_row_type(self.db(), model_instance, flat)?
+                django_values_list_all_fields_row_type(
+                    self.db(),
+                    self.program_environment(),
+                    model_instance,
+                    flat,
+                )?
             }
         } else {
             let mut columns = Vec::with_capacity(args.len());
@@ -10961,7 +11094,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 self.django_named_values_list_row_type(call_expression, columns)
             } else {
                 let row_types = columns.into_iter().map(|(_, row_ty)| row_ty);
-                Type::heterogeneous_tuple(self.db(), row_types)
+                Type::heterogeneous_tuple(self.db(), self.program_environment(), row_types)
             }
         };
 
@@ -10973,7 +11106,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return None;
         }
 
-        django_queryset_with_row_type(self.db(), return_ty, row_ty)
+        django_queryset_with_row_type(self.db(), self.program_environment(), return_ty, row_ty)
     }
 
     fn django_queryset_row_type_for_values_call(
@@ -10985,19 +11118,27 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let Type::BoundMethod(bound_method) = callable_type else {
             return None;
         };
-        if bound_method.function(self.db()).name(self.db()).as_str() != "values" {
+        if bound_method
+            .function(self.db())
+            .is_none_or(|function| function.name(self.db()).as_str() != "values")
+        {
             return None;
         }
 
         let model_instance = model_instance_from_django_queryset_like(
             self.db(),
+            self.program_environment(),
             bound_method.self_instance(self.db()),
         )?;
 
         let row_ty = if call_expression.arguments.args.is_empty()
             && call_expression.arguments.keywords.is_empty()
         {
-            django_values_all_fields_row_type(self.db(), model_instance)?
+            django_values_all_fields_row_type(
+                self.db(),
+                self.program_environment(),
+                model_instance,
+            )?
         } else {
             let mut items = TypedDictSchema::default();
             for arg in &call_expression.arguments.args {
@@ -11030,11 +11171,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             Type::TypedDict(TypedDictType::from_schema_items(self.db(), items))
         };
 
-        django_queryset_with_row_type(self.db(), return_ty, row_ty)
+        django_queryset_with_row_type(self.db(), self.program_environment(), return_ty, row_ty)
     }
 
     fn django_aggregate_class_name(&self, ty: Type<'db>) -> Option<&'db str> {
-        let class = ty.nominal_class(self.db())?;
+        let class = ty.nominal_class(self.db(), self.program_environment())?;
         let mut class_name = None;
         let mut is_aggregate = false;
 
@@ -11087,8 +11228,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
 
         match aggregate_name {
-            "Count" => KnownClass::Int.to_instance(self.db()),
-            "Avg" | "StdDev" | "Variance" => KnownClass::Float.to_instance(self.db()),
+            "Count" => KnownClass::Int.to_instance(self.db(), self.program_environment()),
+            "Avg" | "StdDev" | "Variance" => {
+                KnownClass::Float.to_instance(self.db(), self.program_environment())
+            }
             "Max" | "Min" | "Sum" => {
                 let ast::Expr::Call(call) = expr else {
                     return Type::unknown();
@@ -11148,14 +11291,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         call.arguments.args.first().map(|value| {
             let value_ty = self.expression_type(value);
             if value_ty.is_unknown() {
-                Self::django_literal_expression_type(self.db(), value).unwrap_or(value_ty)
+                Self::django_literal_expression_type(self.db(), self.program_environment(), value)
+                    .unwrap_or(value_ty)
             } else {
                 value_ty
             }
         })
     }
 
-    fn django_literal_expression_type(db: &'db dyn Db, expr: &ast::Expr) -> Option<Type<'db>> {
+    fn django_literal_expression_type(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        expr: &ast::Expr,
+    ) -> Option<Type<'db>> {
         match expr {
             ast::Expr::StringLiteral(literal)
                 if literal.value.len() <= Self::MAX_STRING_LITERAL_SIZE =>
@@ -11167,12 +11315,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 ast::Number::Int(int) => int
                     .as_i64()
                     .map(Type::int_literal)
-                    .or_else(|| Some(KnownClass::Int.to_instance(db))),
-                ast::Number::Float(_) => Some(KnownClass::Float.to_instance(db)),
-                ast::Number::Complex { .. } => Some(KnownClass::Complex.to_instance(db)),
+                    .or_else(|| Some(KnownClass::Int.to_instance(db, env))),
+                ast::Number::Float(_) => Some(KnownClass::Float.to_instance(db, env)),
+                ast::Number::Complex { .. } => Some(KnownClass::Complex.to_instance(db, env)),
             },
             ast::Expr::BooleanLiteral(literal) => Some(Type::bool_literal(literal.value)),
-            ast::Expr::NoneLiteral(_) => Some(Type::none(db)),
+            ast::Expr::NoneLiteral(_) => Some(Type::none(db, env)),
             _ => None,
         }
     }
@@ -11180,39 +11328,50 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     fn django_output_field_type_from_name(&self, name: &str) -> Option<Type<'db>> {
         match name {
             "CharField" | "EmailField" | "SlugField" | "TextField" | "URLField" => {
-                Some(KnownClass::Str.to_instance(self.db()))
+                Some(KnownClass::Str.to_instance(self.db(), self.program_environment()))
             }
             "IntegerField" | "AutoField" | "BigAutoField" | "SmallAutoField" => {
-                Some(KnownClass::Int.to_instance(self.db()))
+                Some(KnownClass::Int.to_instance(self.db(), self.program_environment()))
             }
-            "FloatField" => Some(KnownClass::Float.to_instance(self.db())),
-            "BooleanField" | "NullBooleanField" => Some(KnownClass::Bool.to_instance(self.db())),
+            "FloatField" => {
+                Some(KnownClass::Float.to_instance(self.db(), self.program_environment()))
+            }
+            "BooleanField" | "NullBooleanField" => {
+                Some(KnownClass::Bool.to_instance(self.db(), self.program_environment()))
+            }
             "DateField" => Some(resolve_stdlib_instance(
                 self.db(),
+                self.program_environment(),
                 KnownModule::Datetime,
                 "date",
             )),
             "DateTimeField" => Some(resolve_stdlib_instance(
                 self.db(),
+                self.program_environment(),
                 KnownModule::Datetime,
                 "datetime",
             )),
             "TimeField" => Some(resolve_stdlib_instance(
                 self.db(),
+                self.program_environment(),
                 KnownModule::Datetime,
                 "time",
             )),
             "DecimalField" => Some(resolve_stdlib_instance(
                 self.db(),
+                self.program_environment(),
                 KnownModule::Decimal,
                 "Decimal",
             )),
             "UUIDField" => Some(resolve_stdlib_instance(
                 self.db(),
+                self.program_environment(),
                 KnownModule::Uuid,
                 "UUID",
             )),
-            "BinaryField" => Some(KnownClass::Bytes.to_instance(self.db())),
+            "BinaryField" => {
+                Some(KnownClass::Bytes.to_instance(self.db(), self.program_environment()))
+            }
             _ => None,
         }
     }
@@ -11229,26 +11388,27 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     fn is_django_annotation_expression_type(&self, ty: Type<'db>) -> bool {
-        ty.nominal_class(self.db()).is_some_and(|class| {
-            class
-                .iter_mro(self.db())
-                .filter_map(super::super::class_base::ClassBase::into_class)
-                .filter_map(|base| base.static_class_literal(self.db()).map(|(base, _)| base))
-                .any(|base| {
-                    matches!(
-                        base.name(self.db()).as_str(),
-                        "Case"
-                            | "Cast"
-                            | "CombinedExpression"
-                            | "Combinable"
-                            | "Expression"
-                            | "ExpressionWrapper"
-                            | "Func"
-                            | "RawSQL"
-                            | "Subquery"
-                    )
-                })
-        })
+        ty.nominal_class(self.db(), self.program_environment())
+            .is_some_and(|class| {
+                class
+                    .iter_mro(self.db())
+                    .filter_map(super::super::class_base::ClassBase::into_class)
+                    .filter_map(|base| base.static_class_literal(self.db()).map(|(base, _)| base))
+                    .any(|base| {
+                        matches!(
+                            base.name(self.db()).as_str(),
+                            "Case"
+                                | "Cast"
+                                | "CombinedExpression"
+                                | "Combinable"
+                                | "Expression"
+                                | "ExpressionWrapper"
+                                | "Func"
+                                | "RawSQL"
+                                | "Subquery"
+                        )
+                    })
+            })
     }
 
     fn django_expression_type_or_call_name_matches(
@@ -11257,17 +11417,22 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         expr: &ast::Expr,
         names: &[&str],
     ) -> bool {
-        ty.nominal_class(self.db()).is_some_and(|class| {
-            class
-                .iter_mro(self.db())
-                .filter_map(super::super::class_base::ClassBase::into_class)
-                .filter_map(|base| base.static_class_literal(self.db()).map(|(base, _)| base))
-                .any(|base| names.contains(&base.name(self.db()).as_str()))
-        }) || Self::django_call_name(expr).is_some_and(|name| names.contains(&name))
+        ty.nominal_class(self.db(), self.program_environment())
+            .is_some_and(|class| {
+                class
+                    .iter_mro(self.db())
+                    .filter_map(super::super::class_base::ClassBase::into_class)
+                    .filter_map(|base| base.static_class_literal(self.db()).map(|(base, _)| base))
+                    .any(|base| names.contains(&base.name(self.db()).as_str()))
+            })
+            || Self::django_call_name(expr).is_some_and(|name| names.contains(&name))
     }
 
     fn django_expression_type_or_call_name(&self, expr: &ast::Expr) -> Option<String> {
-        if let Some(class) = self.expression_type(expr).nominal_class(self.db()) {
+        if let Some(class) = self
+            .expression_type(expr)
+            .nominal_class(self.db(), self.program_environment())
+        {
             if let Some(name) = class
                 .iter_mro(self.db())
                 .filter_map(super::super::class_base::ClassBase::into_class)
@@ -11331,8 +11496,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     .iter()
                     .filter_map(|element| self.django_expression_output_field_member_type(*element))
                     .collect();
-                return (!elements.is_empty())
-                    .then(|| UnionType::from_elements(self.db(), elements));
+                return (!elements.is_empty()).then(|| {
+                    UnionType::from_elements(self.db(), self.program_environment(), elements)
+                });
             }
             Type::Intersection(intersection) => {
                 if let Some(output_ty) = intersection
@@ -11350,7 +11516,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return None;
         }
 
-        let class = ty.nominal_class(self.db())?;
+        let class = ty.nominal_class(self.db(), self.program_environment())?;
         if matches!(
             class.name(self.db()).as_str(),
             "Case"
@@ -11376,7 +11542,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let DefinitionKind::Class(class_node) = definition.kind(self.db()) else {
             return None;
         };
-        let module = parsed_module(self.db(), definition.file(self.db())).load(self.db());
+        let module = parsed_module(
+            self.db(),
+            definition.program_file(self.db()).python_file(self.db()),
+        )
+        .load(self.db());
 
         class_node
             .node(&module)
@@ -11506,13 +11676,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let Type::BoundMethod(bound_method) = callable_type else {
             return None;
         };
-        let method_name = bound_method.function(self.db()).name(self.db());
+        let method_name = bound_method.function(self.db())?.name(self.db());
         if !matches!(method_name.as_str(), "aggregate" | "aaggregate") {
             return None;
         }
 
         let model_instance = model_instance_from_django_queryset_like(
             self.db(),
+            self.program_environment(),
             bound_method.self_instance(self.db()),
         )?;
 
@@ -11546,10 +11717,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let aggregate_ty = Type::TypedDict(TypedDictType::from_schema_items(self.db(), items));
         if method_name.as_str() == "aaggregate" {
-            Some(
-                KnownClass::CoroutineType
-                    .to_specialized_instance(self.db(), &[Type::any(), Type::any(), aggregate_ty]),
-            )
+            Some(KnownClass::CoroutineType.to_specialized_instance(
+                self.db(),
+                self.program_environment(),
+                &[Type::any(), Type::any(), aggregate_ty],
+            ))
         } else {
             Some(aggregate_ty)
         }
@@ -11559,9 +11731,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         &self,
         queryset_ty: Type<'db>,
     ) -> Option<(Type<'db>, Type<'db>)> {
-        let model_ty = model_instance_from_django_queryset_like(self.db(), queryset_ty)?;
+        let model_ty = model_instance_from_django_queryset_like(
+            self.db(),
+            self.program_environment(),
+            queryset_ty,
+        )?;
         let row_ty = queryset_ty
-            .class_specialization(self.db())
+            .class_specialization(self.db(), self.program_environment())
             .and_then(|(_, specialization)| specialization.types(self.db()).get(1).copied())
             .unwrap_or(model_ty);
         Some((model_ty, row_ty))
@@ -11587,28 +11763,38 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         model_ty: Type<'db>,
         row_ty: Type<'db>,
     ) -> Option<Type<'db>> {
-        django_queryset_with_model_and_row_type(self.db(), return_ty, model_ty, row_ty).or_else(
-            || {
-                let queryset_base = django_queryset_base_instance_with_model_and_row_type(
-                    self.db(),
-                    self.file(),
-                    model_ty,
-                    row_ty,
-                )?;
-                let combined =
-                    IntersectionType::from_two_elements(self.db(), queryset_base, return_ty);
-                // A concrete queryset subclass (e.g. `class ArticleQuerySet(QuerySet["Article"])`)
-                // bakes its model into an invariant type argument, so intersecting it with a base
-                // queryset specialized to a different model collapses to `Never`. Keep the original
-                // return type in that case: the caller still carries the new model via the
-                // annotation protocol it intersects on top, which model extraction folds back in.
-                if combined.is_never() {
-                    Some(return_ty)
-                } else {
-                    Some(combined)
-                }
-            },
+        django_queryset_with_model_and_row_type(
+            self.db(),
+            self.program_environment(),
+            return_ty,
+            model_ty,
+            row_ty,
         )
+        .or_else(|| {
+            let queryset_base = django_queryset_base_instance_with_model_and_row_type(
+                self.db(),
+                self.program_environment(),
+                self.file(),
+                model_ty,
+                row_ty,
+            )?;
+            let combined = IntersectionType::from_two_elements(
+                self.db(),
+                self.program_environment(),
+                queryset_base,
+                return_ty,
+            );
+            // A concrete queryset subclass (e.g. `class ArticleQuerySet(QuerySet["Article"])`)
+            // bakes its model into an invariant type argument, so intersecting it with a base
+            // queryset specialized to a different model collapses to `Never`. Keep the original
+            // return type in that case: the caller still carries the new model via the
+            // annotation protocol it intersects on top, which model extraction folds back in.
+            if combined.is_never() {
+                Some(return_ty)
+            } else {
+                Some(combined)
+            }
+        })
     }
 
     fn django_queryset_return_type_for_annotate_call(
@@ -11709,12 +11895,17 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let annotation_protocol = Type::protocol_with_readonly_members(
             self.db(),
+            self.program_environment(),
             annotation_fields
                 .iter()
                 .map(|(name, ty)| (name.as_str(), *ty)),
         );
-        let annotated_model =
-            IntersectionType::from_two_elements(self.db(), model_ty, annotation_protocol);
+        let annotated_model = IntersectionType::from_two_elements(
+            self.db(),
+            self.program_environment(),
+            model_ty,
+            annotation_protocol,
+        );
         let annotated_row = if row_ty == model_ty {
             annotated_model
         } else {
@@ -11728,6 +11919,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         )?;
         Some(IntersectionType::from_two_elements(
             self.db(),
+            self.program_environment(),
             return_ty,
             annotation_protocol,
         ))
@@ -11828,18 +12020,28 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .and_then(|queryset| {
                     model_instance_from_django_queryset_like(
                         self.db(),
+                        self.program_environment(),
                         self.expression_type(queryset),
                     )
                 })
                 .or_else(|| {
                     lookup.and_then(|lookup| {
-                        django_prefetch_related_model(self.db(), model_instance, lookup)
+                        django_prefetch_related_model(
+                            self.db(),
+                            self.program_environment(),
+                            model_instance,
+                            lookup,
+                        )
                     })
                 })
                 .unwrap_or_else(Type::unknown);
             prefetch_fields.push((
                 Name::new(to_attr),
-                KnownClass::List.to_specialized_instance(self.db(), &[elem_ty]),
+                KnownClass::List.to_specialized_instance(
+                    self.db(),
+                    self.program_environment(),
+                    &[elem_ty],
+                ),
             ));
         }
         prefetch_fields
@@ -11868,12 +12070,17 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let annotation_protocol = Type::protocol_with_readonly_members(
             self.db(),
+            self.program_environment(),
             prefetch_fields
                 .iter()
                 .map(|(name, ty)| (name.as_str(), *ty)),
         );
-        let annotated_model =
-            IntersectionType::from_two_elements(self.db(), model_ty, annotation_protocol);
+        let annotated_model = IntersectionType::from_two_elements(
+            self.db(),
+            self.program_environment(),
+            model_ty,
+            annotation_protocol,
+        );
         let annotated_row = if row_ty == model_ty {
             annotated_model
         } else {
@@ -11897,7 +12104,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
         if !django_queryset_method_may_return_receiver_model(method_attr.attr.as_str())
             && self.django_queryset_model_and_row_type(return_ty).is_none()
-            && !Self::django_return_type_may_contain_model(return_ty, self.db())
+            && !Self::django_return_type_may_contain_model(
+                return_ty,
+                self.db(),
+                self.program_environment(),
+            )
         {
             return None;
         }
@@ -11905,9 +12116,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let receiver_ty = self.expression_type(&method_attr.value);
         let (receiver_model_ty, receiver_row_ty) =
             self.django_queryset_model_and_row_type(receiver_ty)?;
-        let receiver_model_class = static_class_from_instance(self.db(), receiver_model_ty)?;
+        let receiver_model_class =
+            static_class_from_instance(self.db(), self.program_environment(), receiver_model_ty)?;
         let nominal_receiver_model_ty = Type::instance(
             self.db(),
+            self.program_environment(),
             receiver_model_class.default_specialization(self.db()),
         );
 
@@ -11930,13 +12143,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         receiver_model_ty: Type<'db>,
         receiver_row_ty: Type<'db>,
     ) -> Option<Type<'db>> {
-        if static_class_from_instance(self.db(), return_ty) == Some(receiver_model_class) {
+        if static_class_from_instance(self.db(), self.program_environment(), return_ty)
+            == Some(receiver_model_class)
+        {
             return Some(receiver_model_ty);
         }
 
         if let Some((return_model_ty, return_row_ty)) =
             self.django_queryset_model_and_row_type(return_ty)
-            && static_class_from_instance(self.db(), return_model_ty) == Some(receiver_model_class)
+            && static_class_from_instance(self.db(), self.program_environment(), return_model_ty)
+                == Some(receiver_model_class)
         {
             let row_ty = if return_row_ty == return_model_ty {
                 receiver_model_ty
@@ -11972,16 +12188,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             })
             .collect();
 
-        changed.then(|| UnionType::from_elements(self.db(), elements))
+        changed.then(|| UnionType::from_elements(self.db(), self.program_environment(), elements))
     }
 
-    fn django_return_type_may_contain_model(return_ty: Type<'db>, db: &'db dyn Db) -> bool {
+    fn django_return_type_may_contain_model(
+        return_ty: Type<'db>,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> bool {
         match return_ty {
             Type::Union(union) => union
                 .elements(db)
                 .iter()
-                .any(|element| Self::django_return_type_may_contain_model(*element, db)),
-            _ => static_class_from_instance(db, return_ty)
+                .any(|element| Self::django_return_type_may_contain_model(*element, db, env)),
+            _ => static_class_from_instance(db, env, return_ty)
                 .is_some_and(|class| class.is_django_model(db)),
         }
     }
@@ -11999,7 +12219,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         let receiver_ty = self.expression_type(&method_attr.value);
-        if is_django_queryset_instance(self.db(), receiver_ty) {
+        if is_django_queryset_instance(self.db(), self.program_environment(), receiver_ty) {
             return Some(receiver_ty);
         }
 
@@ -12010,11 +12230,22 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let owner_ty = self.expression_type(&manager_attr.value);
 
         if let Type::ClassLiteral(ClassLiteral::Static(model_class)) = owner_ty {
-            return django_queryset_instance_for_model_manager(self.db(), model_class, member_name);
+            return django_queryset_instance_for_model_manager(
+                self.db(),
+                self.program_environment(),
+                model_class,
+                member_name,
+            );
         }
 
-        let model_class = static_class_from_instance(self.db(), owner_ty)?;
-        django_queryset_instance_for_reverse_manager(self.db(), model_class, member_name)
+        let model_class =
+            static_class_from_instance(self.db(), self.program_environment(), owner_ty)?;
+        django_queryset_instance_for_reverse_manager(
+            self.db(),
+            self.program_environment(),
+            model_class,
+            member_name,
+        )
     }
 
     fn is_django_manager_from_queryset_call(&self, call_expression: &ast::ExprCall) -> bool {
@@ -12034,7 +12265,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return false;
         };
 
-        is_django_queryset_class(self.db(), queryset_class)
+        is_django_queryset_class(self.db(), self.program_environment(), queryset_class)
     }
 
     fn django_meta_get_field_return_type_for_call(
@@ -12044,7 +12275,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let (field_arg, model_owner_ty, field_name) =
             self.django_meta_get_field_call_parts(call_expression)?;
 
-        if !django_meta_has_field(self.db(), model_owner_ty, field_name.value.to_str()) {
+        if !django_meta_has_field(
+            self.db(),
+            self.program_environment(),
+            model_owner_ty,
+            field_name.value.to_str(),
+        ) {
             let builder = self.context.report_lint(&UNKNOWN_ARGUMENT, field_arg)?;
             builder.into_diagnostic(format_args!(
                 "Django model field `{}` does not exist",
@@ -12055,6 +12291,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         django_meta_get_field_return_type(
             self.db(),
+            self.program_environment(),
             self.file(),
             model_owner_ty,
             field_name.value.to_str(),
@@ -12104,7 +12341,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             Type::FunctionLiteral(function)
                 if function.name(self.db()).as_str() == "get_user_model" =>
             {
-                file_to_module(self.db(), function.file(self.db())).is_some_and(|module| {
+                file_to_module(
+                    self.db(),
+                    function.program_file(self.db()).resolver_file(self.db()),
+                )
+                .is_some_and(|module| {
                     module
                         .name(self.db())
                         .as_str()
@@ -12123,7 +12364,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return None;
         }
 
-        Some(resolve_auth_user_model_reference(self.db(), self.file()))
+        Some(resolve_auth_user_model_reference(
+            self.db(),
+            self.program_environment(),
+            self.file(),
+        ))
     }
 
     fn check_django_querydict_is_mutable(
@@ -12136,7 +12381,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return;
         };
         if !return_ty.is_never()
-            || !is_django_querydict_instance(self.db(), bound_method.self_instance(self.db()))
+            || !is_django_querydict_instance(
+                self.db(),
+                self.program_environment(),
+                bound_method.self_instance(self.db()),
+            )
         {
             return;
         }
@@ -12149,7 +12398,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
         builder.into_diagnostic("This QueryDict is immutable.");
     }
-
 
     fn infer_call_expression_impl(
         &mut self,
@@ -12729,7 +12977,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.check_django_queryset_lookup_call(callable_type, call_expression);
         let current_method_instance = self
             .class_context_of_current_method()
-            .map(|class| Type::instance(self.db(), class));
+            .map(|class| Type::instance(self.db(), self.program_environment(), class));
         self.check_django_model_init_call(class, call_expression, current_method_instance);
 
         for binding in bindings.iter_flat_mut() {
@@ -13972,8 +14220,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         if django_attribute_base_may_be_settings(value)
-            && let Some(settings_member_ty) =
-                django_settings_member_type(db, self.file(), value_type, &attr.id)
+            && let Some(settings_member_ty) = django_settings_member_type(
+                db,
+                self.program_environment(),
+                self.file(),
+                value_type,
+                &attr.id,
+            )
         {
             return Ok(TypeAndQualifiers::new(
                 settings_member_ty,
@@ -14015,12 +14268,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.narrow_expr_with_applicable_constraints(attribute, ty, &constraint_keys)
         });
 
-        if is_django_queryset_or_manager_instance_by_name(db, value_type) {
+        if is_django_queryset_or_manager_instance_by_name(
+            db,
+            self.program_environment(),
+            value_type,
+        ) {
             let strict_place = value_type
                 .member_lookup_with_policy(
                     db,
                     env,
-                    attr.id.clone(),
+                    &attr.id,
                     MemberLookupPolicy::NO_GETATTR_LOOKUP
                         | MemberLookupPolicy::MRO_NO_OBJECT_FALLBACK,
                 )
@@ -16485,7 +16742,6 @@ fn django_attribute_base_may_be_settings(value: &ast::Expr) -> bool {
         _ => false,
     }
 }
-
 
 #[derive(Copy, Clone, Debug)]
 enum BoundOrConstraintsNodes<'ast> {

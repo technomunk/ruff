@@ -366,19 +366,20 @@ impl<'db> AllMembers<'db> {
             // Synthesized protocols (e.g. `Callable[...]`, or the queryset-method protocols ty
             // synthesizes for Django managers) have no class body to walk, so the meta-type path
             // below would miss their members. Enumerate the protocol's interface directly instead.
-            Type::ProtocolInstance(protocol) if protocol.to_nominal_instance().is_none() => {
+            Type::ProtocolInstance(protocol) if protocol.class_origin(db).is_none() => {
                 for member in protocol.interface(db).members(db) {
                     if let Place::Defined(DefinedPlace { ty: member_ty, .. }) =
-                        ty.member(db, member.name()).place
+                        ty.member(db, env, member.name()).place
                     {
                         self.members.insert(Member {
                             name: Name::new(member.name()),
                             ty: member_ty,
+                            is_type_check_only: false,
                         });
                     }
                 }
                 // A protocol instance is still an object.
-                self.extend_with_type(db, Type::object());
+                self.extend_with_type(db, env, Type::object());
             }
 
             Type::LiteralValue(_)
@@ -724,16 +725,18 @@ impl<'db> AllMembers<'db> {
         {
             for name in crate::types::class::django_model::django_synthesized_instance_member_names(
                 db,
+                env,
                 static_class,
             ) {
                 if let Place::Defined(DefinedPlace {
                     ty: synthetic_member,
                     ..
-                }) = ty.member(db, name.as_str()).place
+                }) = ty.member(db, env, name.as_str()).place
                 {
                     self.members.insert(Member {
                         name,
                         ty: synthetic_member,
+                        is_type_check_only: false,
                     });
                 }
             }

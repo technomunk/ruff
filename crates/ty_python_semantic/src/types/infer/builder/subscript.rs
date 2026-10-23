@@ -225,7 +225,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .class_context_of_current_method()?
             .static_class_literal(self.db())?
             .0;
-        django_form_declared_field(self.db(), form_class, field_name.value.to_str())
+        django_form_declared_field(
+            self.db(),
+            self.program_environment(),
+            form_class,
+            field_name.value.to_str(),
+        )
     }
 
     fn infer_subscript_load_impl(

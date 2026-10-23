@@ -41,7 +41,7 @@ use crate::{
             typed_dict::{TypedDictFields, synthesize_typed_dict_method, typed_dict_class_member},
         },
         context::InferContext,
-        dedicated::{django, pydantic},
+        dedicated::pydantic,
         definition_expression_type, determine_self_class,
         diagnostic::INVALID_DATACLASS_OVERRIDE,
         enums::{enum_metadata, is_enum_class_by_inheritance, try_unwrap_nonmember_value},
@@ -237,7 +237,7 @@ impl<'db> StaticClassLiteral<'db> {
     }
 
     /// Return `true` if this class inherits from `django.db.models.Model`.
-    #[salsa::tracked(cycle_initial=|_, _, _| false, heap_size=ruff_memory_usage::heap_size)]
+    #[salsa::tracked(returns(copy), cycle_initial=|_, _, _| false, heap_size=ruff_memory_usage::heap_size)]
     pub(crate) fn is_django_model(self, db: &'db dyn Db) -> bool {
         self.iter_mro(db, None).any(|base| {
             base.into_class()
@@ -1676,12 +1676,12 @@ impl<'db> StaticClassLiteral<'db> {
                 return Member::definitely_declared(synthesized_member);
             }
             if let Some(synthesized_member) =
-                super::django_model::synthesize_django_class_member(db, self, name)
+                super::django_model::synthesize_django_class_member(db, env, self, name)
             {
                 return Member::definitely_declared(synthesized_member);
             }
             if let Some(synthesized_member) =
-                super::django_model::synthesize_inherited_django_manager_member(db, self, name)
+                super::django_model::synthesize_inherited_django_manager_member(db, env, self, name)
             {
                 return Member::definitely_declared(synthesized_member);
             }
@@ -1729,24 +1729,24 @@ impl<'db> StaticClassLiteral<'db> {
         // synthesized instance type rather than the descriptor. This is technically
         // wrong but acceptable until class-vs-instance access can be distinguished.
         if let Some(ty) =
-            super::django_model::synthesize_django_auth_boolean_instance_member(db, self, name)
+            super::django_model::synthesize_django_auth_boolean_instance_member(db, env, self, name)
         {
             return Member::definitely_declared(ty);
         }
         if let Some(ty) =
-            super::django_model::synthesize_django_field_instance_member(db, self, name)
+            super::django_model::synthesize_django_field_instance_member(db, env, self, name)
         {
             return Member::definitely_declared(ty);
         }
 
-        
-
         member.map_type(|ty| {
-            super::django_model::specialize_declared_django_manager_class_member(db, self, name, ty)
-                .or_else(|| {
-                    super::django_model::specialize_declared_django_manager_member(db, self, ty)
-                })
-                .unwrap_or(ty)
+            super::django_model::specialize_declared_django_manager_class_member(
+                db, env, self, name, ty,
+            )
+            .or_else(|| {
+                super::django_model::specialize_declared_django_manager_member(db, env, self, ty)
+            })
+            .unwrap_or(ty)
         })
     }
 
@@ -1760,10 +1760,6 @@ impl<'db> StaticClassLiteral<'db> {
         inherited_generic_context: Option<GenericContext<'db>>,
         name: &str,
     ) -> Option<Type<'db>> {
-        if let Some(member) = django::synthesized_member(db, env, self, specialization, name) {
-            return Some(member);
-        }
-
         // Handle `@functools.total_ordering`: synthesize comparison methods
         // for classes that have `@total_ordering` and define at least one
         // ordering method. The decorator requires at least one of __lt__,
@@ -3037,21 +3033,23 @@ impl<'db> StaticClassLiteral<'db> {
         // them with a placeholder annotation (e.g. `is_staff: object`), so this synthesis must run
         // before field synthesis, which would otherwise claim such an annotation and shadow `bool`.
         if let Some(ty) =
-            super::django_model::synthesize_django_auth_boolean_instance_member(db, self, name)
+            super::django_model::synthesize_django_auth_boolean_instance_member(db, env, self, name)
         {
             return Member::definitely_declared(ty);
         }
 
         // Some Django ecosystem decorators synthesize runtime QuerySet/Manager members.
         if let Some(ty) =
-            super::django_model::synthesize_django_queryset_instance_member(db, self, name)
+            super::django_model::synthesize_django_queryset_instance_member(db, env, self, name)
         {
             return Member::definitely_declared(ty);
         }
 
         // Django model fields are synthesized from AST-level field assignments
         // (e.g. `title = CharField(...)`) rather than inferred from the descriptor type.
-        if let Some(ty) = super::django_model::synthesize_django_instance_member(db, self, name) {
+        if let Some(ty) =
+            super::django_model::synthesize_django_instance_member(db, env, self, name)
+        {
             return Member::definitely_declared(ty);
         }
 
@@ -3470,10 +3468,13 @@ pub(crate) fn expanded_class_base_entries<'a, 'db>(
                 let ty = if matches!(base_node, ast::Expr::Starred(_)) {
                     Type::unknown()
                 } else {
-                    django_manager_factory_base_type(db, class_definition.file(db), base_node)
-                        .unwrap_or_else(|| {
-                            definition_expression_type(db, class_definition, base_node)
-                        })
+                    django_manager_factory_base_type(
+                        db,
+                        &ProgramEnvironment::from_definition(class_definition),
+                        class_definition.file(db),
+                        base_node,
+                    )
+                    .unwrap_or_else(|| definition_expression_type(db, class_definition, base_node))
                 };
                 expanded_bases.push(ExpandedClassBaseEntry {
                     source_node: base_node,

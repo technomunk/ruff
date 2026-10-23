@@ -753,7 +753,7 @@ reveal_type(User.objects.values_list("name"))  # revealed: QuerySet[User, tuple[
 reveal_type(User.objects.values_list("name", "age"))  # revealed: QuerySet[User, tuple[str, str | int]]
 reveal_type(User.objects.values_list("name", "age", named=True))  # revealed: QuerySet[User, Row]
 reveal_type(User.objects.values_list(flat=True))  # revealed: QuerySet[User, str | int]
-reveal_type(User.objects.values_list())  # revealed: QuerySet[User, tuple[str | int, str, str | int, float]]
+reveal_type(User.objects.values_list())  # revealed: QuerySet[User, tuple[str | int, str, str | int, float*]]
 reveal_type(User.objects.values_list(named=True))  # revealed: QuerySet[User, Row]
 reveal_type(User.objects.values_list("name", flat=True))  # revealed: QuerySet[User, str]
 reveal_type(User.objects.values_list("age", flat=True))  # revealed: QuerySet[User, str | int]
@@ -781,12 +781,12 @@ User.objects.annotate(name=Value("Ada"))  # error: [invalid-argument-type]
 User.objects.annotate(display_name=Value("Ada")).annotate(display_name=Value("Grace"))  # error: [invalid-argument-type]
 User.objects.values("age").annotate(age=Value(1))  # error: [invalid-argument-type]
 # fmt: off
-reveal_type(User.objects.values("name").annotate(age=Value(1)).values("age"))  # revealed: QuerySet[User, <TypedDict with items 'age'>]
+reveal_type(User.objects.values("name").annotate(age=Value(1)).values("age"))  # revealed: QuerySet[User & <Protocol with members 'age'>, <TypedDict with items 'age'>]
 User.objects.values_list("age").annotate(age=Value(1))  # error: [invalid-argument-type]
-reveal_type(User.objects.values_list("name").annotate(age=Value(1)).values("age"))  # revealed: QuerySet[User, <TypedDict with items 'age'>]
-reveal_type(User.objects.values_list("name", flat=True).annotate(age=Value(1)).values("age"))  # revealed: QuerySet[User, <TypedDict with items 'age'>]
+reveal_type(User.objects.values_list("name").annotate(age=Value(1)).values("age"))  # revealed: QuerySet[User & <Protocol with members 'age'>, <TypedDict with items 'age'>]
+reveal_type(User.objects.values_list("name", flat=True).annotate(age=Value(1)).values("age"))  # revealed: QuerySet[User & <Protocol with members 'age'>, <TypedDict with items 'age'>]
 User.objects.values_list("age", named=True).annotate(age=Value(1))  # error: [invalid-argument-type]
-reveal_type(User.objects.values_list("name", named=True).annotate(age=Value(1)).values("age"))  # revealed: QuerySet[User, <TypedDict with items 'age'>]
+reveal_type(User.objects.values_list("name", named=True).annotate(age=Value(1)).values("age"))  # revealed: QuerySet[User & <Protocol with members 'age'>, <TypedDict with items 'age'>]
 # fmt: on
 reveal_type(User.objects.annotate(display_name=F("name")).get().display_name)  # revealed: str
 User.objects.annotate(display_name=F("name")).filter(display_name="Ada")
